@@ -1,0 +1,4 @@
+exp_name: "SegDiff"       # Experiment name for logging
+description: "Diffusion-based segmentation model for 3D medical images"  # Description of the experiment
+version: 1.0                              # Configuration version
+tags: ["diffusion", "segmentation", "3D", "medical imaging"]  # Tags for categorization

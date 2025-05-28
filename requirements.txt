@@ -1,0 +1,13 @@
+monai
+omegaconf
+aim
+pytorch-ignite
+plotly
+SimpleITK
+nibabel
+matplotlib!=3.6.1
+scikit-image
+scikit-learn
+scipy
+pandas
+tqdm

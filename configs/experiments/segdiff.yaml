@@ -1,0 +1,60 @@
+name: "SegDiff"       # Experiment name for logging
+description: "Implemented SegDiff (Cloned) for PET Data"  # Description of the experiment
+version: 1.0                              # Configuration version
+tags: ["diffusion", "segmentation", "3D", "medical imaging"]  # Tags for categorization
+
+train:
+  save_dir: "outputs/segdiff"            # Where to save logs, checkpoints, config
+
+  eval:
+    validation_interval: 1                         # Validate every N epochs
+    visualize: true                     # Visualize predictions during validation
+    visualize_interval: 1                  # Visualize every N evaluation
+    save_predictions: true                  # Save predicted masks
+    save_predictions_interval: 1           # Save every N evaluations
+    metrics: ["dice", "hausdorff"]          # Evaluation metrics
+    early_stopping: true                  # Enable early stopping
+    patience: 20                           # Patience for early stopping
+
+
+data:
+  train_jsonl: "/home/yb107/cvit-work/cvpr2025/DukeDiffSeg/data/json/PET.jsonl"  # JSONL file listing training image/label paths
+  val_jsonl: "/home/yb107/cvit-work/cvpr2025/DukeDiffSeg/data/json/PET_val.jsonl"      # JSONL file listing validation image/label paths
+ 
+model:
+  name: "SegDiff"                        # Main model class name
+
+  # Denoising UNet  
+  image_size: 64  # Size of the input image (e.g., 64, 128, 256)
+  num_channels: 128  # Number of base channels in the model
+  num_res_blocks: 2  # Number of residual blocks per resolution level
+  num_heads: 4  # Number of attention heads
+  num_heads_upsample: -1  # Number of attention heads during upsampling (-1 to reuse num_heads)
+  attention_resolutions: "16,8"  # Resolutions at which attention is applied (comma-separated)
+  dropout: 0.0  # Dropout rate
+  rrdb_blocks: 10  # Number of RRDB blocks (for super-resolution)
+  deeper_net: false  # Use deeper network architecture
+  learn_sigma: false  # Predict both mean and variance if true
+  sigma_small: false  # Use smaller fixed variance
+  class_cond: false  # Enable class conditioning
+  class_name: "train"  # Class name (used if class_cond is true)
+  expansion: false  # Expand model input/layers (custom logic)
+  diffusion_steps: 100  # Number of diffusion steps
+  noise_schedule: "linear"  # Noise schedule type (linear, cosine, etc.)
+  timestep_respacing: ""  # Custom timestep spacing (empty means default)
+  use_kl: false  # Use KL loss instead of MSE
+  predict_xstart: false  # Predict initial image instead of noise
+  rescale_timesteps: true  # Rescale time steps to [0, 1]
+  rescale_learned_sigmas: true  # Rescale learned sigmas
+  use_checkpoint: false  # Enable gradient checkpointing
+  use_scale_shift_norm: true  # Use scale-shift normalization
+
+  # Super-resolution specific
+  large_size: 256  # Target large image size
+  small_size: 64  # Input small image size
+
+  schedule_sampler: "uniform"
+  clip_denoised: false
+  ema_rate: 0.9999
+  lr_anneal_steps: 0
+
