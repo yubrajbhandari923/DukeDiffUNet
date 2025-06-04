@@ -11,3 +11,9 @@ scikit-learn
 scipy
 pandas
 tqdm
+torchvision
+kornia
+blobfile
+mpi4py
+fury
+xvfbwrapper

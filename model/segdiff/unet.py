@@ -344,7 +344,7 @@ class UNetModel(nn.Module):
 
         if self.num_classes is not None:
             self.label_emb = nn.Embedding(num_classes, time_embed_dim)
-        self.rrdb = RRDBNet(nb=rrdb_blocks, out_nc=model_channels)
+        self.rrdb = RRDBNet(in_nc=in_channels,nb=rrdb_blocks, out_nc=model_channels)
         self.input_blocks = nn.ModuleList(
             [
                 TimestepEmbedSequential(

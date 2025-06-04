@@ -1,0 +1,30 @@
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[packages]
+monai = "*"
+omegaconf = "*"
+aim = "*"
+pytorch-ignite = "*"
+plotly = "*"
+simpleitk = "*"
+nibabel = "*"
+matplotlib = "!=3.6.1"
+scikit-image = "*"
+scikit-learn = "*"
+scipy = "*"
+pandas = "*"
+tqdm = "*"
+torchvision = "*"
+kornia = "*"
+blobfile = "*"
+mpi4py = "*"
+fury = "*"
+xvfbwrapper = "*"
+
+[dev-packages]
+
+[requires]
+python_version = "3.10"

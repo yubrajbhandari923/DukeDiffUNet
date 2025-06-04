@@ -5,6 +5,8 @@ tags: ["diffusion", "segmentation", "3D", "medical imaging"]  # Tags for categor
 
 train:
   save_dir: "outputs/segdiff"            # Where to save logs, checkpoints, config
+  batch_size: 1                          # Batch size for training
+  micro_batch_size: 1                  # Micro-batch size for gradient accumulation
 
   eval:
     validation_interval: 1                         # Validate every N epochs
@@ -18,21 +20,26 @@ train:
 
 
 data:
-  train_jsonl: "/home/yb107/cvit-work/cvpr2025/DukeDiffSeg/data/json/PET.jsonl"  # JSONL file listing training image/label paths
-  val_jsonl: "/home/yb107/cvit-work/cvpr2025/DukeDiffSeg/data/json/PET_val.jsonl"      # JSONL file listing validation image/label paths
+  train_jsonl: "/home/yb107/cvpr2025/DukeDiffSeg/data/json/PET.jsonl"  # JSONL file listing training image/label paths
+  val_jsonl: "/home/yb107/cvpr2025/DukeDiffSeg/data/json/PET_val.jsonl"      # JSONL file listing validation image/label paths
+  roi_size: [32, 32, 32]                # Shape of input volume patches
+  pixdim: [1.0, 1.0, 3.0]                     # Voxel dimensions in mm
+  val_num_samples: 4                # Number of samples to validate on during validation
+ 
  
 model:
   name: "SegDiff"                        # Main model class name
 
   # Denoising UNet  
-  image_size: 64  # Size of the input image (e.g., 64, 128, 256)
-  num_channels: 128  # Number of base channels in the model
-  num_res_blocks: 2  # Number of residual blocks per resolution level
-  num_heads: 4  # Number of attention heads
+  image_size: 32  # Size of the input image (e.g., 64, 128, 256)
+  num_channels: 64  # Number of base channels in the model
+  num_res_blocks: 1  # Number of residual blocks per resolution level
+  channel_mult: [1,2,2]  # Channel multiplier for each resolution level (list of integers)
+  num_heads: 1  # Number of attention heads
   num_heads_upsample: -1  # Number of attention heads during upsampling (-1 to reuse num_heads)
-  attention_resolutions: "16,8"  # Resolutions at which attention is applied (comma-separated)
+  attention_resolutions: ""  # Resolutions at which attention is applied (comma-separated)
   dropout: 0.0  # Dropout rate
-  rrdb_blocks: 10  # Number of RRDB blocks (for super-resolution)
+  rrdb_blocks: 3  # Number of RRDB blocks (for super-resolution)
   deeper_net: false  # Use deeper network architecture
   learn_sigma: false  # Predict both mean and variance if true
   sigma_small: false  # Use smaller fixed variance
@@ -46,15 +53,17 @@ model:
   predict_xstart: false  # Predict initial image instead of noise
   rescale_timesteps: true  # Rescale time steps to [0, 1]
   rescale_learned_sigmas: true  # Rescale learned sigmas
-  use_checkpoint: false  # Enable gradient checkpointing
+  use_checkpoint: true  # Enable gradient checkpointing
   use_scale_shift_norm: true  # Use scale-shift normalization
 
   # Super-resolution specific
-  large_size: 256  # Target large image size
-  small_size: 64  # Input small image size
+  large_size: 64  # Target large image size
+  small_size: 32  # Input small image size
 
   schedule_sampler: "uniform"
   clip_denoised: false
   ema_rate: 0.9999
   lr_anneal_steps: 0
+  use_fp16: true  # Use mixed precision training
+  fp16_scale_growth: 1e-3
 

@@ -15,11 +15,16 @@ class ResidualDenseBlock_5C(nn.Module):
     def __init__(self, nf=64, gc=32, bias=True):
         super(ResidualDenseBlock_5C, self).__init__()
         # gc: growth channel, i.e. intermediate channels
-        self.conv1 = nn.Conv2d(nf, gc, 3, 1, 1, bias=bias)
-        self.conv2 = nn.Conv2d(nf + gc, gc, 3, 1, 1, bias=bias)
-        self.conv3 = nn.Conv2d(nf + 2 * gc, gc, 3, 1, 1, bias=bias)
-        self.conv4 = nn.Conv2d(nf + 3 * gc, gc, 3, 1, 1, bias=bias)
-        self.conv5 = nn.Conv2d(nf + 4 * gc, nf, 3, 1, 1, bias=bias)
+        # self.conv1 = nn.Conv2d(nf, gc, 3, 1, 1, bias=bias)
+        # self.conv2 = nn.Conv2d(nf + gc, gc, 3, 1, 1, bias=bias)
+        # self.conv3 = nn.Conv2d(nf + 2 * gc, gc, 3, 1, 1, bias=bias)
+        # self.conv4 = nn.Conv2d(nf + 3 * gc, gc, 3, 1, 1, bias=bias)
+        # self.conv5 = nn.Conv2d(nf + 4 * gc, nf, 3, 1, 1, bias=bias)
+        self.conv1 = nn.Conv3d(nf, gc, 3, 1, 1, bias=bias)
+        self.conv2 = nn.Conv3d(nf + gc, gc, 3, 1, 1, bias=bias)
+        self.conv3 = nn.Conv3d(nf + 2 * gc, gc, 3, 1, 1, bias=bias)
+        self.conv4 = nn.Conv3d(nf + 3 * gc, gc, 3, 1, 1, bias=bias)
+        self.conv5 = nn.Conv3d(nf + 4 * gc, nf, 3, 1, 1, bias=bias)
         self.lrelu = nn.LeakyReLU(negative_slope=0.2, inplace=True)
 
         # initialization
@@ -55,11 +60,17 @@ class RRDBNet(nn.Module):
         super(RRDBNet, self).__init__()
         RRDB_block_f = functools.partial(RRDB, nf=nf, gc=gc)
 
-        self.conv_first = nn.Conv2d(in_nc, nf, 3, 1, 1, bias=True)
+        # self.conv_first = nn.Conv2d(in_nc, nf, 3, 1, 1, bias=True)
+        # self.RRDB_trunk = make_layer(RRDB_block_f, nb)
+        # self.trunk_conv = nn.Conv2d(nf, nf, 3, 1, 1, bias=True)
+        # self.HRconv = nn.Conv2d(nf, nf, 3, 1, 1, bias=True)
+        # self.conv_last = nn.Conv2d(nf, out_nc, 3, 1, 1, bias=True)
+
+        self.conv_first = nn.Conv3d(in_nc, nf, 3, 1, 1, bias=True)
         self.RRDB_trunk = make_layer(RRDB_block_f, nb)
-        self.trunk_conv = nn.Conv2d(nf, nf, 3, 1, 1, bias=True)
-        self.HRconv = nn.Conv2d(nf, nf, 3, 1, 1, bias=True)
-        self.conv_last = nn.Conv2d(nf, out_nc, 3, 1, 1, bias=True)
+        self.trunk_conv = nn.Conv3d(nf, nf, 3, 1, 1, bias=True)
+        self.HRconv = nn.Conv3d(nf, nf, 3, 1, 1, bias=True)
+        self.conv_last = nn.Conv3d(nf, out_nc, 3, 1, 1, bias=True)
 
         self.lrelu = nn.LeakyReLU(negative_slope=0.2, inplace=True)
 
