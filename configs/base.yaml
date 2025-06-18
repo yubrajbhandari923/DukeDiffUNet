@@ -4,33 +4,7 @@ version: 0                              # Configuration version, must be overrid
 tags: []  # Tags for categorization,\
 
 train:
-  seed: 42                                 # Random seed for reproducibility
-  epochs: 200                              # Total number of epochs
-  accumulate_grad_steps: 1                # Gradient accumulation
-  fp16: true                               # Mixed precision training
-  device: "cuda"                           # Training device
-  save_dir: "outputs/ex-000"            # Where to save logs, checkpoints, config
-
-  # Optimizer
-  optimizer:
-    name: "AdamW"
-    lr: 1e-4
-    weight_decay: 0.01
-
-  # Learning rate scheduler
-  scheduler:
-    name: "CosineAnnealingLR"
-    T_max: 50
-
-  # Checkpointing
-  save_interval: 10                        # Save checkpoint every N epochs
-  resume: ""                               # Path to checkpoint to resume from
-
-  logging:
-    use_aim: true                            # Enable AIM logging
-    aim_repo: "aim/"                         # AIM repo directory
-    log_interval: 10                         # Log every N iterations
-
+  seed: 42  # Placeholder for train config, must be overridden by the experiment config
  
 loss:
   denoising_loss: "MSE"                   # Loss for diffusion denoising
@@ -38,13 +12,7 @@ loss:
 
 
 data: # Dataset / Data Loader configuration
-  train_jsonl: "data/splits/train.jsonl"    # JSONL file listing training image/label paths
-  val_jsonl: "data/splits/val.jsonl"        # JSONL file listing validation image/label paths
-  roi_size: [128, 128, 64]                # Shape of input volume patches
-  pixdim: [1.0, 1.0, 3.0]                     # Voxel dimensions in mm
-  num_workers: 1                           # DataLoader workers
-  cache_in_memory: false                    # If true, loads all volumes into memory
-  batch_size: 1                            # Number of volumes per batch
+  dataset: null  # Placeholder for data config, must be overridden by the experiment config
 
 model:
   name: "BaseModelName"                # Main model class name

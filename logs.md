@@ -1,0 +1,15 @@
+## 🧪 Experiment Log – 2025-06-04 6:20PM: 
+Running the Basic DDP code on plp-capri.
+CUDA_VISIBLE_DEVICES=3,4,5,6 OMP_NUM_THREADS=8 nohup torchrun --nproc_per_node=4 -m train.segdiff_1_0 \
+  --exp_config /home/yb107/cvpr2025/DukeDiffSeg/configs/experiments/segdiff.yaml > /home/yb107/logs/train_segdiff.log 2>&1 &
+  (Because 1,2 GPU are running in capri for some reason)
+  
+- Look at `tail -f /home/yb107/logs/train_segdiff.log`
+- To kill the nohup process: `ps aux | grep train.segdiff_1_0` then `kill $pid`
+
+For some reason rank 0 seems not to be working.
+
+
+
+
+

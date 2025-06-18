@@ -4,9 +4,32 @@ version: 1.0                              # Configuration version
 tags: ["diffusion", "segmentation", "3D", "medical imaging"]  # Tags for categorization
 
 train:
+  seed: 42                                 # Random seed for reproducibility
+  epochs: 200                              # Total number of epochs
+  accumulate_grad_steps: 1                # Gradient accumulation
+  fp16: true                               # Mixed precision training
+  device: "cuda"                           # Training device
   save_dir: "outputs/segdiff"            # Where to save logs, checkpoints, config
-  batch_size: 1                          # Batch size for training
-  micro_batch_size: 1                  # Micro-batch size for gradient accumulation
+  # Checkpointing
+  save_interval: 10                        # Save checkpoint every N epochs
+  resume: null                               # Path to checkpoint to resume from
+
+  # Optimizer
+  optimizer:
+    name: "AdamW"
+    lr: 1e-4
+    weight_decay: 0.01
+
+  # Learning rate scheduler
+  lr_scheduler:
+    name: "CosineAnnealingLR"
+    T_max: 50
+
+  logging:
+    use_aim: true                            # Enable AIM logging
+    aim_repo: "aim/"                         # AIM repo directory
+    log_interval: 10                         # Log every N iterations
+
 
   eval:
     validation_interval: 1                         # Validate every N epochs
@@ -25,7 +48,9 @@ data:
   roi_size: [32, 32, 32]                # Shape of input volume patches
   pixdim: [1.0, 1.0, 3.0]                     # Voxel dimensions in mm
   val_num_samples: 4                # Number of samples to validate on during validation
- 
+  num_workers: 4                        # Number of data loading workers
+  batch_size: 1                          # Batch size for training
+  micro_batch_size: 1                  # Micro-batch size for gradient accumulation
  
 model:
   name: "SegDiff"                        # Main model class name
