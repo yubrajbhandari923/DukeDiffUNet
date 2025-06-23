@@ -23,6 +23,7 @@ blobfile = "*"
 mpi4py = "*"
 fury = "*"
 xvfbwrapper = "*"
+batchgenerators = "*"
 
 [dev-packages]
 

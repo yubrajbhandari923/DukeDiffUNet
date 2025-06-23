@@ -49,7 +49,8 @@ def model_and_diffusion_defaults():
         num_channels=128,
         num_res_blocks=2,
         num_heads=4,
-        in_ch = 5,
+        in_ch = 2,
+        out_ch = 2, # Yubraj Added
         num_heads_upsample=-1,
         num_head_channels=-1,
         attention_resolutions="16,8",
@@ -82,6 +83,7 @@ def create_model_and_diffusion(
     num_res_blocks,
     channel_mult,
     in_ch,
+    out_ch,
     num_heads,
     num_head_channels,
     num_heads_upsample,
@@ -112,6 +114,7 @@ def create_model_and_diffusion(
         use_checkpoint=use_checkpoint,
         attention_resolutions=attention_resolutions,
         in_ch = in_ch,
+        out_ch = out_ch,
         num_heads=num_heads,
         num_head_channels=num_head_channels,
         num_heads_upsample=num_heads_upsample,
@@ -146,6 +149,7 @@ def create_model(
     use_checkpoint=False,
     attention_resolutions="16",
     in_ch=4,
+    out_ch=2,
     num_heads=1,
     num_head_channels=-1,
     num_heads_upsample=-1,
@@ -155,6 +159,7 @@ def create_model(
     use_fp16=False,
     use_new_attention_order=False,
     version = 'new',
+    num_classes=None,
 ):
     if channel_mult == "":
         if image_size == 512:
@@ -170,6 +175,8 @@ def create_model(
     else:
         channel_mult = tuple(int(ch_mult) for ch_mult in channel_mult.split(","))
 
+    num_classes = NUM_CLASSES if class_cond else None
+    
     attention_ds = []
     for res in attention_resolutions.split(","):
         attention_ds.append(image_size // int(res))
@@ -178,12 +185,12 @@ def create_model(
         image_size=image_size,
         in_channels=in_ch,
         model_channels=num_channels,
-        out_channels=2,#(3 if not learn_sigma else 6),
+        out_channels=out_ch,#(3 if not learn_sigma else 6),
         num_res_blocks=num_res_blocks,
         attention_resolutions=tuple(attention_ds),
         dropout=dropout,
         channel_mult=channel_mult,
-        num_classes=(NUM_CLASSES if class_cond else None),
+        num_classes=num_classes,
         use_checkpoint=use_checkpoint,
         use_fp16=use_fp16,
         num_heads=num_heads,

@@ -25,6 +25,7 @@ from monai.transforms import (
     ResizeWithPadOrCropd,
     RandSpatialCropSamplesd,
     RandCropByPosNegLabeld,
+    SplitDim,
 )
 from ignite.engine import Events
 from ignite.handlers import EarlyStopping, ModelCheckpoint, global_step_from_engine

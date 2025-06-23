@@ -182,9 +182,7 @@ class TrainLoop:
                     # reinitialize data loader
                     data_iter = iter(self.dataloader)
                     batch, cond, name = next(data_iter)
-
             self.run_step(batch, cond)
-
            
             i += 1
           

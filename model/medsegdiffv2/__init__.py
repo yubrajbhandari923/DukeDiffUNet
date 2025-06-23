@@ -3,13 +3,17 @@
 # Actual Train Script Source:
 # https://github.com/SuperMedIntel/MedSegDiff/blob/master/scripts/segmentation_train.py
 
-from guided_diffusion.script_util import (
+from .guided_diffusion.script_util import (
     model_and_diffusion_defaults,
     create_model_and_diffusion,
     # args_to_dict,
 )
+import torch
+import logging
 
-from guided_diffusion.resample import create_named_schedule_sampler
+logging.basicConfig(level=logging.INFO)
+
+from .guided_diffusion.resample import create_named_schedule_sampler
 
 
 class MedSegDiffModel:
@@ -19,10 +23,14 @@ class MedSegDiffModel:
         else:
             default = model_and_diffusion_defaults()
 
+            del_keys = []
             # remove unexpected keys
             for key in args:
                 if key not in default:
-                    del args[key]
+                    del_keys.append(key)
+            
+            for key in del_keys:
+                del args[key]
 
             # add missing keys
             for key in default:
@@ -39,5 +47,5 @@ class MedSegDiffModel:
     def get_diffusion(self):
         return self.diffusion
 
-    def get_schedule_sampler(self, name):
-        return create_named_schedule_sampler(name, self.diffusion)
+    def get_schedule_sampler(self, name, maxt):
+        return create_named_schedule_sampler(name, self.diffusion, maxt=maxt)

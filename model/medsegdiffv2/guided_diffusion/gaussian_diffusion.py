@@ -343,7 +343,7 @@ class GaussianDiffusion:
 
 
     def _predict_xstart_from_eps(self, x_t, t, eps):
-        assert x_t.shape == eps.shape
+        assert x_t.shape == eps.shape, f"x_t shape {x_t.shape} != eps shape {eps.shape}"
         return (
             _extract_into_tensor(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t
             - _extract_into_tensor(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * eps
@@ -397,6 +397,7 @@ class GaussianDiffusion:
         """
         alpha_bar = _extract_into_tensor(self.alphas_cumprod, t, x.shape)
 
+        # eps is the model’s estimate of the added noise to the clean image at timestep t.
         eps = self._predict_eps_from_xstart(x, t, p_mean_var["pred_xstart"])
 
         eps = eps.detach() - (1 - alpha_bar).sqrt() *p_mean_var["update"]*0
@@ -556,7 +557,7 @@ class GaussianDiffusion:
 
             cal_out = torch.clamp(final["cal"] + 0.25 * final["sample"][:,-1,:,:].unsqueeze(1), 0, 1)
         else:
-            print('no dpm-solver')
+            # print('no dpm-solver')
             i = 0
             letters = string.ascii_lowercase
             name = ''.join(random.choice(letters) for i in range(10)) 

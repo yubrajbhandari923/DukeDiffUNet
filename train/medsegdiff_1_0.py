@@ -3,11 +3,14 @@ import sys
 import logging
 import json
 import copy
+import monai.transforms
 import numpy as np
 import argparse
 import functools
+import nibabel
 
 from typing import Iterable, Callable, Any, Sequence
+import aim
 from aim.pytorch_ignite import AimLogger
 from omegaconf import OmegaConf
 
@@ -27,6 +30,7 @@ from monai.data import DataLoader, Dataset
 from monai.transforms import (
     Compose,
     LoadImaged,
+    Orientationd,
     RandSpatialCropd,
     RandFlipd,
     RandRotate90d,
@@ -37,7 +41,7 @@ from monai.transforms import (
     ResizeWithPadOrCropd,
     RandSpatialCropSamplesd,
     RandCropByPosNegLabeld,
-    SplitDim,
+    SplitDimd,
 )
 from monai.engines.utils import (
     IterationEvents,
@@ -56,14 +60,15 @@ from monai.data import list_data_collate, NumpyReader
 from monai.engines import Evaluator, Trainer
 from monai.utils.enums import CommonKeys as Keys
 
-from utils.monai_helpers import AimIgniteImageHandler
-from utils.monai_transforms import DropKeysd
-from model.medsegdiffv2 import MedSegDiffModel
+
 from model.medsegdiffv2.guided_diffusion.resample import LossAwareSampler, UniformSampler
+from model.medsegdiffv2.guided_diffusion.fp16_util import MixedPrecisionTrainer
+from model.medsegdiffv2.guided_diffusion.utils import staple
+from model.medsegdiffv2 import MedSegDiffModel
+# from model.medsegdiffv2.guided_diffusion.custom_dataset_loader import CustomDataset3D
+
 from utils.profiling import profile_block, TorchProfiler, init_profiler
 
-
-logging.basicConfig(stream=sys.stdout, level=logging.INFO)
 
 # region utils (EMA update, get_args, update_ema)
 
@@ -106,13 +111,12 @@ def get_args():
 
     return config
 
-
 # endregion
 
 # region Diffusion Trainer and Evaluator
 
 class DiffusionTrainer(Trainer):
-
+    """https://github.com/SuperMedIntel/MedSegDiff/blob/master/scripts/segmentation_train.py and TrainLoop in train_util.py"""
     def __init__(
         self,
         device: str | torch.device,
@@ -121,7 +125,6 @@ class DiffusionTrainer(Trainer):
         network: torch.nn.Module,
         diffusion: Any,  # e.g. GaussianDiffusion
         optimizer: Optimizer,
-        loss_function: Callable,
         epoch_length: int | None = None,
         schedule_sampler: Any | None = None,  # e.g. UniformSampler
         prepare_batch: Callable = default_prepare_batch,
@@ -159,99 +162,49 @@ class DiffusionTrainer(Trainer):
         self.network = network
         self.diffusion = diffusion
         self.optimizer = optimizer
-        self.loss_function = loss_function
         self.schedule_sampler = (
             schedule_sampler if schedule_sampler is not None else diffusion.uniform_sampler()
         )
         self.inferer = SimpleInferer() if inferer is None else inferer
         self.optim_set_to_none = optim_set_to_none
 
+        self.mp_trainer = MixedPrecisionTrainer(
+            model=self.network,
+            use_fp16=False,
+            fp16_scale_growth=self.amp_kwargs.get("fp16_scale_growth", 1e-3),
+        )
+
     @profile_block("train_iteration")
-    def _iteration(self, engine, batchdata: Any) -> dict:
-        if batchdata is None:
-            raise ValueError("Must provide batch data for current iteration.")
-
-        # 1. Load and prepare real images
-        images = engine.prepare_batch(batchdata, engine.state.device, engine.non_blocking, **engine.to_kwargs)
-        batch_size = images.shape[0]
-
-        # 2. Sample timesteps and add noise
-        t, noise = self.schedule_sampler.sample(batch_size, self.diffusion)
-        noisy_images = self.diffusion.q_sample(images, t, noise)
-
-        # 3. Model prediction
-        engine.state.output = {
-            Keys.IMAGE: images,
-            "noisy": noisy_images,
-            "timestep": t,
-            "noise": noise,
-        }
-        def _forward_loss():
-            pred = self.inferer(noisy_images, self.network, t)
-            engine.fire_event(IterationEvents.FORWARD_COMPLETED)
-            loss = self.loss_function(pred, noise).mean()
-            engine.state.output[Keys.PRED] = pred
-            engine.state.output[Keys.LOSS] = loss
-            engine.fire_event(IterationEvents.LOSS_COMPLETED)
-
-        # 4. Backpropagation
-        self.network.train()
-        self.optimizer.zero_grad(set_to_none=self.optim_set_to_none)
-        if engine.amp:
-            with torch.cuda.amp.autocast(**engine.amp_kwargs):
-                _forward_loss()
-            engine.scaler.scale(engine.state.output[Keys.LOSS]).backward()
-            engine.fire_event(IterationEvents.BACKWARD_COMPLETED)
-            engine.scaler.step(self.optimizer)
-            engine.scaler.update()
-        else:
-            _forward_loss()
-            engine.state.output[Keys.LOSS].backward()
-            engine.fire_event(IterationEvents.BACKWARD_COMPLETED)
-            self.optimizer.step()
-
-        engine.fire_event(IterationEvents.MODEL_COMPLETED)
-        return engine.state.output
-
     def _iteration(self, engine, batchdata):
-        # logging.debug(f"Running iteration on rank {engine.state.rank}")
-        if len(batch) == 2:
-            batch, cond = batch
-        else:
-            raise ValueError(
-                f"Expected batch to have 2 elements (inputs, targets), got {len(batch)}, batach shape: {batchdata.shape if hasattr(batchdata, 'shape') else 'N/A'}"
-            )
-
-        dist.barrier()  # Ensure all ranks are synchronized before logging
+        # logging.info(f"Running iteration on rank {engine.state.rank}")
         rank = engine.state.rank
-        logging.info(f"Rank {rank}, batch size: {inputs.shape}, target size: {targets.shape}")
+        
+        batchdata = engine.prepare_batch(
+            batchdata, engine.state.device, engine.non_blocking
+        )        
+        images, labels = batchdata
 
-        inputs = inputs.to(engine.state.device, non_blocking=engine.non_blocking)
-        targets = targets.to(engine.state.device, non_blocking=engine.non_blocking)
+        engine.network.train()
+        self.mp_trainer.zero_grad()
 
         # For segmentation tasks, inputs are usually images and targets are segmentation masks.
         # But for diffusion models, segmentation masks are often used data and images are used as conditions.
 
-        engine.state.output = {Keys.IMAGE: inputs, Keys.LABEL: targets}
+        engine.state.output = {Keys.IMAGE: images, Keys.LABEL: labels}
 
         # in the original segDiff TrainLoop they have x_t from segmentation mask and {"conditioned_image": Image}
 
         # 2) sample timesteps & weights
-        t, weights = self.schedule_sampler.sample(targets.shape[0], engine.state.device)
+        t, weights = self.schedule_sampler.sample(labels.shape[0], engine.state.device)
 
         # 3) compute the diffusion losses
-        compute_losses = functools.partial(
-            self.diffusion.training_losses_segmentation,
-            engine.network,
-            None, # From medsegdiffv2/guided_diffusion/train_utils.py,
-            targets,
-            t,
-            model_kwargs={
-                "conditioned_image": inputs
-            },  # or fill in conditioning if you have labels
-        )
+        labels = torch.cat((labels, images), dim=1)  # Concatenate images and labels if needed
 
-        losses1 = compute_losses()
+        # if rank == 0:
+        # logging.info(f"Labels shape: {labels.shape}, t: {t.shape}, weights: {weights.shape}")
+            
+        with engine.network.no_sync():
+            losses1 = self.diffusion.training_losses_segmentation(engine.network, None, labels, t, model_kwargs={})
 
         if isinstance(self.schedule_sampler, LossAwareSampler):
             self.schedule_sampler.update_with_local_losses(
@@ -268,18 +221,20 @@ class DiffusionTrainer(Trainer):
         engine.state.output[Keys.LOSS] = loss
 
         # 4) standard backward + step
-        engine.network.train()
         engine.optimizer.zero_grad(set_to_none=engine.optim_set_to_none)
 
-        loss.backward()
+        self.mp_trainer.backward(loss)
         engine.fire_event(IterationEvents.BACKWARD_COMPLETED)
-        engine.optimizer.step()
+        # engine.optimizer.step()
+        self.mp_trainer.optimize(engine.optimizer)
         engine.fire_event(IterationEvents.MODEL_COMPLETED)
 
         return engine.state.output
 
 
 class DiffusionEvaluator(Evaluator):
+
+    """ Implement https://github.com/SuperMedIntel/MedSegDiff/blob/master/scripts/segmentation_sample.py """
     def __init__(
         self,
         device,
@@ -294,7 +249,9 @@ class DiffusionEvaluator(Evaluator):
         key_val_metric=None,
         val_handlers=None,
         amp=False,
+        use_fp16=False,
         mode="eval",
+        ddim=False,
     ):
         # Initialize base evaluator without default iteration_update
         super().__init__(
@@ -317,6 +274,8 @@ class DiffusionEvaluator(Evaluator):
         self.schedule_sampler = schedule_sampler
         self.n_rounds = n_rounds
         self.major_vote = major_vote_number
+        self.ddim = ddim
+        self.use_fp16 = use_fp16
 
     @profile_block("eval_iteration")
     def _iteration(self, engine, batchdata):
@@ -325,7 +284,23 @@ class DiffusionEvaluator(Evaluator):
             batchdata, engine.state.device, engine.non_blocking
         )
         # engine.state.output = {Keys.IMAGE: inputs, Keys.LABEL: targets}
-        engine.state.output = {'y': targets}
+        engine.state.output = {
+            Keys.IMAGE: inputs,
+            Keys.LABEL: targets,
+            Keys.PRED: None,  # Placeholder for predictions
+            'y': targets,  # Assuming 'y' is the ground truth mask
+            'y_pred': None,  # Placeholder for predictions
+        }
+
+        batchsize = inputs.shape[0]
+        
+
+        # targets = torch.cat((targets, inputs), dim=1)  # Concatenate inputs and targets if needed
+        noise = torch.randn_like(inputs[:, :1, ...])
+        image = torch.cat((inputs, noise), dim=1)
+
+        # if self.use_fp16:
+        #     engine.network.convert_to_fp16()  # Convert model to half precision if using FP16
 
         # 2) perform major-vote sampling
         with torch.no_grad():
@@ -334,23 +309,49 @@ class DiffusionEvaluator(Evaluator):
             for _ in range(self.n_rounds):
                 # sample timesteps for each round
                 # p_sample_loop will loop internally over timesteps
-                x = self.diffusion.p_sample_loop(
-                    self.network,
-                    (self.major_vote, targets.shape[1], *inputs.shape[2:]),
-                    noise=None,
-                    clip_denoised=False,
-                    denoised_fn=None,
-                    model_kwargs={"conditioned_image": inputs},
-                    device=engine.state.device,
-                    progress=False,
-                )
-                # normalize from [-1,1] to [0,1]
-                x = (x + 1.0) / 2.0
-                # average across vote dimension and round to binary
-                vote_mean = x.mean(dim=0, keepdim=True).round()
-                votes.append(vote_mean)
+
+                # sample, x_noisy, org, cal, cal_out = sample_fn(
+                #     model,
+                #     (args.batch_size, 3, args.image_size, args.image_size),
+                #     img,
+                #     step=args.diffusion_steps,
+                #     clip_denoised=args.clip_denoised,
+                #     model_kwargs=model_kwargs,
+                # )
+
+                if not self.ddim:
+                    x = self.diffusion.p_sample_loop_known(
+                        self.network,
+                        (batchsize, 2, *inputs.shape[2:]), image,
+                        step = self.diffusion.num_timesteps,
+                        noise=None,
+                        clip_denoised=False,
+                        denoised_fn=None,
+                        model_kwargs={},
+                        device=engine.state.device,
+                        progress=False,
+                    )
+                else:
+                    x = self.diffusion.ddim_sample_loop_known(
+                        self.network,
+                        (batchsize, 2, *inputs.shape[2:]), image,
+                        step=self.diffusion.num_timesteps,
+                        noise=None,
+                        clip_denoised=False,
+                        denoised_fn=None,
+                        model_kwargs={},
+                        device=engine.state.device,
+                        progress=False,
+                    )
+
+                sample, x_noisy, org, cal, cal_out = x
+
+                co = torch.tensor(cal_out)
+                votes.append(sample[:, -1, :, :])
+                # torch.cuda.synchronize()
+
             # final vote: mean of all rounds
-            final_vote = torch.stack(votes).mean(dim=0).round()
+            final_vote = staple(torch.stack(votes, dim=0)).squeeze(0)
 
         # 3) store prediction
         # engine.state.output[Keys.PRED] = final_vote
@@ -359,7 +360,7 @@ class DiffusionEvaluator(Evaluator):
         # 4) save as NIfTI
         # wrap in MetaTensor to preserve spatial metadata
         # SaveImage will read metadata from inputs
-        engine.state.output[Keys.PRED] = final_vote.cpu()
+        engine.state.output[Keys.PRED] = final_vote
 
         # fire events for metrics
         engine.fire_event(IterationEvents.FORWARD_COMPLETED)
@@ -411,6 +412,38 @@ def get_aim_logger(config):
 
     return aim_logger
 
+class GetRandomSlice(monai.transforms.Transform):
+    """
+    A custom transform to get a random slice from a 3D image.
+    """
+    def __init__(self, axis):
+        super().__init__()
+        self.axis = axis
+        
+    def __call__(self, data):
+        image = data[Keys.IMAGE]
+        label = data[Keys.LABEL]
+        
+        if image.ndim != 4 or label.ndim != 4:
+            raise ValueError("Input images must be 4D tensors ((batch), channel, depth, height, width)")
+
+        # Get a random slice index
+        slice_index = np.random.randint(image.shape[self.axis])
+        
+        # Select the slice
+        if self.axis == 1 or self.axis == -3:
+            image_slice = image[:, slice_index, :, :]
+            label_slice = label[:, slice_index, :, :]
+        elif self.axis == 2 or self.axis == -2:
+            image_slice = image[:, :, slice_index, :]
+            label_slice = label[:, :, slice_index, :]
+        elif self.axis == 3 or self.axis == -1:
+            image_slice = image[:, :, :, slice_index]
+            label_slice = label[:, :, :, slice_index]
+        else:
+            raise ValueError("Axis must be 1, 2, or 3 (or -3, -2, -1 for negative indexing)")
+        
+        return {Keys.IMAGE: image_slice, Keys.LABEL: label_slice}
 
 @profile_block("get_dataloaders")
 def get_dataloaders(config, aim_logger, rank, world_size):
@@ -421,107 +454,78 @@ def get_dataloaders(config, aim_logger, rank, world_size):
     with open(config.data.train_jsonl, "r") as f:
         for line in f:
             data = json.loads(line)
-            train_files.append({Keys.IMAGE: data["data"]})
-    # train_files = train_files[:5]
-    
+            train_files.append({Keys.IMAGE: data["image"], Keys.LABEL: data["mask"]})
+    # train_files = train_files[:2]
+
+    train_files = train_files
     if aim_logger is not None and rank == 0:
         aim_logger.experiment.log_info(
             f"Training files {json.dumps(train_files, indent=2)}"
         )
         logging.info(f"Training files length: {len(train_files)}")
+
     
-        
     with open(config.data.val_jsonl, "r") as f:
         for line in f:
             data = json.loads(line)
-            val_files.append({Keys.IMAGE: data["data"]})
-    
+            val_files.append({Keys.IMAGE: data["image"], Keys.LABEL: data["mask"]})
+    # val_files = val_files[:2]
+
     if aim_logger is not None and rank == 0:    
         aim_logger.experiment.log_info(
             f"Validation files {json.dumps(val_files, indent=2)}"
         )
         logging.info(f"Validation files length: {len(val_files)}")
 
-    def set_spacing(meta_tensor, spacing):
-        spacing = (
-            spacing.tolist()
-            if isinstance(spacing, (np.ndarray, torch.Tensor))
-            else spacing
-        )
-        meta_tensor.meta["spacing"] = spacing
-        return meta_tensor
 
     train_transforms = Compose(
         [
-            lambda x: {
-                Keys.IMAGE: x[Keys.IMAGE],
-                Keys.LABEL: x.get(Keys.IMAGE),
-                "spacing": x.get(Keys.IMAGE),
-            },
-            LoadImaged(keys=[Keys.IMAGE], reader=NumpyReader, npz_keys=["imgs"]),
-            LoadImaged(keys=[Keys.LABEL], reader=NumpyReader, npz_keys=["gts"]),
-            lambda data: {
-                Keys.IMAGE: data[Keys.IMAGE],
-                Keys.LABEL: data.get(Keys.LABEL),
-                "Spacing": np.load(data["spacing"])["spacing"],
-            },
-            lambda x: {
-                Keys.IMAGE: set_spacing(x[Keys.IMAGE], x["Spacing"]),
-                Keys.LABEL: set_spacing(x[Keys.LABEL], x["Spacing"]),
-            },
+            LoadImaged(keys=[Keys.IMAGE, Keys.LABEL]),
             EnsureChannelFirstd(keys=[Keys.IMAGE, Keys.LABEL]),
             Spacingd(
                 keys=[Keys.IMAGE, Keys.LABEL],
                 pixdim=config.data.pixdim,
                 mode=["bilinear", "nearest"],
             ),
+            Orientationd(
+                keys=[Keys.IMAGE, Keys.LABEL],
+                axcodes=config.data.orientation,
+            ),
+            # SplitDimd(
+            #     keys=[Keys.IMAGE, Keys.LABEL],
+            #     dim=-1,
+            # ),
+            GetRandomSlice(axis=config.data.slice_axis),  # Custom transform to get a random slice
             RandSpatialCropd(
                 keys=[Keys.IMAGE, Keys.LABEL],
                 roi_size=config.data.roi_size,
                 random_size=False,
+            ),
+            ResizeWithPadOrCropd(
+                keys=[Keys.IMAGE, Keys.LABEL],
+                spatial_size=config.data.roi_size,
             ),
             ToTensord(keys=[Keys.IMAGE, Keys.LABEL]),
         ]
     )
     val_transforms = Compose(
         [
-            lambda x: {
-                Keys.IMAGE: x[Keys.IMAGE],
-                Keys.LABEL: x.get(Keys.IMAGE),
-                "spacing": x.get(Keys.IMAGE),
-            },
-            LoadImaged(keys=[Keys.IMAGE], reader=NumpyReader, npz_keys=["imgs"]),
-            LoadImaged(keys=[Keys.LABEL], reader=NumpyReader, npz_keys=["gts"]),
-            lambda data: {
-                Keys.IMAGE: data[Keys.IMAGE],
-                Keys.LABEL: data.get(Keys.LABEL),
-                "Spacing": np.load(data["spacing"])["spacing"],
-            },
-            lambda x: {
-                Keys.IMAGE: set_spacing(x[Keys.IMAGE], x["Spacing"]),
-                Keys.LABEL: set_spacing(x[Keys.LABEL], x["Spacing"]),
-            },
+            LoadImaged(keys=[Keys.IMAGE, Keys.LABEL]),
             EnsureChannelFirstd(keys=[Keys.IMAGE, Keys.LABEL]),
             Spacingd(
                 keys=[Keys.IMAGE, Keys.LABEL],
                 pixdim=config.data.pixdim,
                 mode=["bilinear", "nearest"],
             ),
-            # RandSpatialCropSamplesd(
-            #     keys=[Keys.IMAGE, Keys.LABEL],
-            #     roi_size=config.data.roi_size,
-            #     random_size=False,
-            #     num_samples=config.data.val_num_samples,
-            # )
-            RandCropByPosNegLabeld(
+            Orientationd(
                 keys=[Keys.IMAGE, Keys.LABEL],
-                label_key=Keys.LABEL,
-                spatial_size=config.data.roi_size,
-                pos=4,
-                neg=1,
+                axcodes=config.data.orientation,
             ),
-            # lambda data: (del data["Spacing"], data)[1],  # remove spacing key
-            # DropKeysd(keys=["Spacing"]),
+            GetRandomSlice(axis=config.data.slice_axis),  # Custom transform to get a random slice
+            ResizeWithPadOrCropd(
+                keys=[Keys.IMAGE, Keys.LABEL],
+                spatial_size=config.data.roi_size,
+            ),
         ]
     )
 
@@ -540,15 +544,6 @@ def get_dataloaders(config, aim_logger, rank, world_size):
     )
     # create a validation data loader
     val_ds = monai.data.Dataset(data=val_files, transform=val_transforms)
-    # val_ds = GridPatchDataset(
-    #     data=val_files,
-    #     patch_iter=PatchIterd(
-    #         keys=[Keys.IMAGE, Keys.LABEL],
-    #         patch_size=config.data.roi_size,
-    #         mode="constant",
-    #     ),
-    #     transform=val_transforms,
-    # )
     val_sampler = DistributedSampler(
         val_ds, num_replicas=world_size, rank=rank, shuffle=False
     )
@@ -565,8 +560,8 @@ def get_dataloaders(config, aim_logger, rank, world_size):
 
 @profile_block("build_model")
 def build_model(config, rank):
-    segdiff = MedSegDiffModel(OmegaConf.resolve(config.model))
-
+    # logging.info(f"{config.model}")
+    segdiff = MedSegDiffModel(args=OmegaConf.to_container(config.model, resolve=True))
     net = segdiff.get_model().to(rank)
 
     dist.barrier()
@@ -583,27 +578,25 @@ def build_model(config, rank):
     # dist_util.sync_params(net.parameters())
 
     diffusion = segdiff.get_diffusion()
-    schedule_sampler = segdiff.get_schedule_sampler(config.model.schedule_sampler)
-
-    loss_fn = DiffusionLossWrapper(net, diffusion, schedule_sampler)
+    schedule_sampler = segdiff.get_schedule_sampler(config.model.schedule_sampler, config.model.diffusion_steps)
 
     opt = optim.AdamW(
         net.parameters(),
         config.train.optimizer.lr,
         weight_decay=config.train.optimizer.weight_decay,
     )
-    return net, loss_fn, opt, diffusion, schedule_sampler
-
+    return net, opt, diffusion, schedule_sampler
 
 def prepare_batch(batch, device=None, non_blocking=True):
     images = batch[Keys.IMAGE].to(device, non_blocking=non_blocking)
-    # cond = {}  # Customize if using labels or other inputs as conditions
-    labels = batch.get(Keys.LABEL)
+    labels = batch[Keys.LABEL].to(device, non_blocking=non_blocking)
+    
+    # logging.info(f"Images shape: {images.shape}, Labels shape: {labels.shape}")
     return images, labels
 
 def prepare_val_batch(batch, device=None, non_blocking=True):
-    images = batch[0][Keys.IMAGE].to(device, non_blocking=non_blocking)
-    labels = batch[0].get(Keys.LABEL)
+    images = batch[Keys.IMAGE].to(device, non_blocking=non_blocking)
+    labels = batch.get(Keys.LABEL).to(device, non_blocking=non_blocking)
     return images, labels
 
 def get_metrics():
@@ -615,7 +608,6 @@ def get_metrics():
         ),
     }
     return metrics
-
 
 def get_post_processing():
     # create a post-processing transform
@@ -629,29 +621,33 @@ def get_post_processing():
     )
     return post_pred
 
-
 # endregion
 
 # region Handlers
 
 
 def attach_checkpoint_handler(trainer, net, opt, ema_params, config, rank):
-    if rank != 0:
-        return
+    # if rank != 0:
+    #     return
     try:
-        ckpt_dir = os.path.join(config.train.save_dir, "checkpoints")
-        logging.info(f"[Rank {rank}] Attaching checkpoint handler at {ckpt_dir}")
-        os.makedirs(ckpt_dir, exist_ok=True)
-
+        # logging.info(f"[Rank {rank}] Attaching checkpoint handler")
+        ckpt_dir = os.path.join(config.train.save_dir, config.name.lower() , "checkpoints")
+        # os.makedirs(ckpt_dir, exist_ok=True)
+        # logging.info(f"[Rank {rank}] Checkpoint directory: {ckpt_dir}")
+        
         checkpoint_handler = ModelCheckpoint(
             dirname=ckpt_dir,
             filename_prefix=config.name,
             n_saved=None,
             require_empty=False,
+            create_dir=True,
             global_step_transform=lambda eng, _: eng.state.epoch,
+            save_on_rank=0,
         )
+        # logging.info(f"[Rank {rank}] Checkpoint handler created")
         trainer.add_event_handler(
-            Events.EPOCH_COMPLETED, checkpoint_handler, {"network": net, "optimizer": opt, "ema_params": ema_params}
+            # Events.EPOCH_COMPLETED, checkpoint_handler, {"network": net, "optimizer": opt, "ema_params": ema_params}
+            Events.EPOCH_COMPLETED, checkpoint_handler, {"network": net, "optimizer": opt}
         )
         logging.info(f"[Rank {rank}] Checkpoint handler attached successfully")
         
@@ -662,7 +658,7 @@ def attach_checkpoint_handler(trainer, net, opt, ema_params, config, rank):
 def attach_ema_update(trainer, net, ema_params, config):
     def update_(engine):
         
-        logging.info(f"[Rank {engine.state.rank}] Updating EMA parameters")
+        # logging.info(f"[Rank {engine.state.rank}] Updating EMA parameters")
         
         for p_ema, p in zip(ema_params[0], net.parameters()):
             update_ema(p_ema, p, rate=config.model.ema_rate)
@@ -736,17 +732,15 @@ def attach_aim_handlers(trainer, val_evaluator, aim_logger, val_loader, rank):
             metric_names=["Mean Dice"],
             global_step_transform=global_step_from_engine(trainer),
         )
-        logging.info(f"[Rank {rank}] Finished attaching AIM handlers")
     except Exception as e:
         logging.exception(f"[Rank {rank}] Failed during attach_aim_handlers: {e}")
 
 # endregion
 
-
 def main(rank, world_size):
-    dist.init_process_group("nccl", init_method='env://', rank=rank, world_size=world_size)
     torch.cuda.set_device(rank)
-    
+    dist.init_process_group("nccl", init_method='env://', rank=rank, world_size=world_size)
+
     config = get_args()
 
     config.train.device = f"cuda:{rank}"
@@ -767,9 +761,7 @@ def main(rank, world_size):
 
     train_loader, val_loader = get_dataloaders(config, aim_logger, rank, world_size)
 
-    net, loss, opt, diffusion, schduler = build_model(config, rank)
-
-    logging.info(f"[Rank {rank}] Finished building model and dataloaders")
+    net, opt, diffusion, schduler = build_model(config, rank)
 
     ema_params = [copy.deepcopy(list(net.parameters())) for _ in range(1)]
 
@@ -779,7 +771,6 @@ def main(rank, world_size):
         train_data_loader=train_loader,
         network=net,
         optimizer=opt,
-        loss_function=loss,
         prepare_batch=prepare_batch,
         diffusion=diffusion,
         schedule_sampler=schduler,
@@ -793,26 +784,38 @@ def main(rank, world_size):
         val_data_loader=val_loader,
         diffusion=diffusion,
         network=net,
-        prepare_batch=default_prepare_batch,
+        prepare_batch= prepare_batch,
         schedule_sampler=schduler,
         postprocessing=post_pred,
         key_val_metric=metrics,
+        ddim=config.model.ddim,
     )
+    logging.info(f"[Rank {rank}] Validation evaluator created")
 
     attach_checkpoint_handler(trainer, net, opt, ema_params, config, rank)
+
+    logging.info(f"[Rank {rank}] Checkpoint handler attached")
 
     # attach_stats_handlers(trainer, val_evaluator, config, rank)
 
     attach_ema_update(trainer, net, ema_params, config)
+    logging.info(f"[Rank {rank}] EMA update handler attached")
 
-    attach_ema_validation(trainer, net, ema_params, val_evaluator, val_loader, config)
+    # attach_ema_validation(trainer, net, ema_params, val_evaluator, val_loader, config)
 
     # attach_validation(trainer, val_evaluator, config)
 
-    attach_aim_handlers(trainer, val_evaluator, aim_logger, val_loader, rank)
+    # attach_aim_handlers(trainer, val_evaluator, aim_logger, val_loader, rank)
 
-    logging.info(f"[Rank {rank}] Finished attaching handlers")
     # val_evaluator.run()
+
+    # Add barrier to ensure all processes are ready before starting training
+    dist.barrier()
+    
+    if rank == 0:
+        logging.info(f"[Rank {rank}] Starting training for {config.train.epochs} epochs")
+        logging.info(f"[Rank {rank}] Training on {len(train_loader.dataset)} training samples")
+        logging.info(f"[Rank {rank}] Validation on {len(val_loader.dataset)} validation samples")
     with TorchProfiler(subdir="trainer_run"):
         trainer.run()
 
