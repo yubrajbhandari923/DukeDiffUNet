@@ -41,6 +41,10 @@ train:
     early_stopping: true                  # Enable early stopping
     patience: 20                           # Patience for early stopping
 
+  amp_kwargs: 
+    fp16_scale_growth: 1e-3
+
+  optim_set_to_none: false
 
 data:
   train_jsonl: "/home/yb107/cvpr2025/DukeDiffSeg/data/json/abdomen_1k_train.jsonl"  # JSONL file listing training image/label paths
@@ -98,5 +102,122 @@ model:
   clip_denoised: false
   ema_rate: 0.9999
   lr_anneal_steps: 0
-  fp16_scale_growth: 1e-3
 
+  n_rounds: 1  # Number of rounds for training
+
+
+
+# # ───────────────────────────────────────────────────────────
+# # Basic experiment metadata
+# experiment:
+#   name:    "MedSegDiff"
+#   version: 1.0
+#   description: "Implemented MedSegDiff (Cloned) for PET Data"
+#   tags: ["MedSegDiff", "diffusion", "segmentation", "3D", "medical imaging"]
+
+# # ───────────────────────────────────────────────────────────
+# # Global seed for reproducibility
+# seed: 42
+
+# # ───────────────────────────────────────────────────────────
+# # Logging & monitoring
+# logging:
+#   use_aim:       true
+#   aim_repo:      "/home/yb107/cvpr2025/DukeDiffSeg/aim/"
+#   log_interval:  10       # iterations
+#   aim_ui_port:   43800
+
+# # ───────────────────────────────────────────────────────────
+# # Data & DataLoader settings
+# data:
+#   train_jsonl:        "/home/yb107/.../abdomen_1k_train.jsonl"
+#   val_jsonl:          "/home/yb107/.../abdomen_1k_val.jsonl"
+#   orientation:        "RAS"
+#   pixdim:             [1.0, 1.0, 3.0]
+#   roi_size:           [256, 256]
+#   slice_axis:         -1
+#   micro_batch_size:   1      # for gradient accumulation
+#   batch_size:         8
+#   val_batch_size:     1
+#   num_workers:        4
+#   val_num_samples:    4
+
+# # ───────────────────────────────────────────────────────────
+# # Training hyperparameters
+# training:
+#   device:              "cuda"
+#   epochs:              2000
+#   accumulate_grad_steps: 1
+#   fp16:                true
+#   optim_set_to_none:   false
+#   save_dir:            "/home/yb107/.../outputs"
+#   save_interval:       50      # epochs
+#   resume:              null
+
+# # ───────────────────────────────────────────────────────────
+# # Optimizer & scheduler
+# optimizer:
+#   name:       "AdamW"
+#   lr:         1e-4
+#   weight_decay: 0.01
+
+# lr_scheduler:
+#   name:       "CosineAnnealingLR"
+#   T_max:      50
+
+# # ───────────────────────────────────────────────────────────
+# # Evaluation & early stopping
+# evaluation:
+#   validation_interval:     1        # epochs
+#   metrics:               ["dice", "hausdorff"]
+#   early_stopping:
+#     enable: true
+#     patience: 20
+#   visualize:             true
+#   visualize_interval:    1
+#   save_predictions:      true
+#   save_pred_interval:    1
+
+# # ───────────────────────────────────────────────────────────
+# # Model architecture (easy to swap out a different 'model.params' block)
+# model:
+#   name:       "MedSegDiff"       # used to select your Python class
+#   params:
+#     # UNet backbone
+#     image_size:        256
+#     in_ch:             2
+#     num_channels:      128
+#     num_res_blocks:    1
+#     out_ch:            1
+#     class_cond:        false
+#     use_checkpoint:    false
+#     use_scale_shift_norm: true
+#     resblock_updown:   false
+#     num_heads:         1
+#     num_head_channels: -1
+#     attention_resolutions: "8"
+#     dropout:           0.0
+
+# # ───────────────────────────────────────────────────────────
+# # Diffusion-specific hyperparameters
+# diffusion:
+#   steps:             1000
+#   noise_schedule:    "linear"
+#   timestep_respacing: ""
+#   use_kl:            false
+#   predict_xstart:    false
+#   rescale_timesteps: true
+#   rescale_learned_sigmas: true
+#   clip_denoised:     false
+#   ddpm_solver:       false
+#   ddim:              false
+#   dpm_solver:        true
+#   schedule_sampler:  "uniform"
+#   ema_rate:          0.9999
+#   lr_anneal_steps:   0
+
+# # ───────────────────────────────────────────────────────────
+# # Mixed-precision & AMP settings
+# amp:
+#   enabled:           true
+#   fp16_scale_growth: 1e-3

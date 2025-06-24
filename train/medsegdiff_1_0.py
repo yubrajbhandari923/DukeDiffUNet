@@ -51,6 +51,7 @@ from monai.engines.utils import (
     default_prepare_batch,
     default_metric_cmp_fn,
 )
+from monai.engines import SupervisedTrainer, SupervisedEvaluator
 from monai.inferers import SimpleInferer, Inferer
 from monai.handlers import (
     MeanDice,
@@ -282,7 +283,6 @@ class DiffusionEvaluator(Evaluator):
         self.ddim = ddim
         self.use_fp16 = use_fp16
 
-
     @profile_block("eval_iteration")
     def _iteration(self, engine, batchdata):
         # 1) prepare image and ground truth mask
@@ -367,7 +367,7 @@ class DiffusionEvaluator(Evaluator):
         # wrap in MetaTensor to preserve spatial metadata
         # SaveImage will read metadata from inputs
         engine.state.output[Keys.PRED] = final_vote
-        
+
         # self.plot_image_label_pred(
         #     inputs, targets, final_vote,
         #     title=f"Rank {engine.state.rank}_Epoch_{engine.state.epoch}_Iteration_{engine.state.iteration}"
@@ -377,6 +377,211 @@ class DiffusionEvaluator(Evaluator):
         engine.fire_event(IterationEvents.FORWARD_COMPLETED)
         engine.fire_event(IterationEvents.MODEL_COMPLETED)
         return engine.state.output
+
+
+# def train_step(engine, batch):
+#     """
+#     iteration_update function for training.
+#     Expects engine.network, engine.diffusion, engine.optimizer,
+#     engine.schedule_sampler, engine.mp_trainer, engine.optim_set_to_none
+#     all to be set as attributes on the engine.
+#     """
+#     # 1) prepare
+#     images, labels = engine.prepare_batch(
+#         batch, engine.state.device, engine.non_blocking
+#     )
+#     engine.network.train()
+#     engine.mp_trainer.zero_grad()
+
+#     engine.state.output = {Keys.IMAGE: images, Keys.LABEL: labels}
+
+#     # 2) sample timesteps & weights
+#     t, weights = engine.schedule_sampler.sample(labels.shape[0], engine.state.device)
+
+#     # 3) diffusion loss
+#     combined = torch.cat((labels, images), dim=1)
+#     with engine.network.no_sync():
+#         loss_dict, sample = engine.diffusion.training_losses_segmentation(
+#             engine.network, None, combined, t, model_kwargs={}
+#         )
+#     if isinstance(engine.schedule_sampler, LossAwareSampler):
+#         engine.schedule_sampler.update_with_local_losses(t, loss_dict["loss"].detach())
+
+#     loss = (loss_dict["loss"] * weights + loss_dict["loss_cal"] * 10).mean()
+#     engine.state.output[Keys.PRED] = sample
+#     engine.state.output[Keys.LOSS] = loss
+
+#     # 4) backward + step
+#     engine.optimizer.zero_grad(set_to_none=engine.optim_set_to_none)
+#     engine.mp_trainer.backward(loss)
+#     engine.mp_trainer.optimize(engine.optimizer)
+
+#     return engine.state.output
+
+
+# def eval_step(engine, batch):
+#     """
+#     iteration_update function for evaluation.
+#     Expects engine.network, engine.diffusion, engine.schedule_sampler,
+#     engine.n_rounds, engine.ddim all on the engine.
+#     """
+#     # 1) prepare
+#     inputs, targets = engine.prepare_batch(
+#         batch, engine.state.device, engine.non_blocking
+#     )
+#     engine.state.output = {
+#         Keys.IMAGE: inputs,
+#         Keys.LABEL: targets,
+#         Keys.PRED: None,
+#         "y": targets,
+#         "y_pred": None,
+#     }
+
+#     batchsize = inputs.shape[0]
+#     noise = torch.randn_like(inputs[:, :1, ...])
+#     img_cond = torch.cat((inputs, noise), dim=1)
+
+#     # 2) major‐vote sampling
+#     votes = []
+#     with torch.no_grad():
+#         for _ in range(engine.n_rounds):
+#             if not engine.ddim:
+#                 out = engine.diffusion.p_sample_loop_known(
+#                     engine.network,
+#                     (batchsize, 2, *inputs.shape[2:]),
+#                     img_cond,
+#                     step=20,
+#                     noise=None,
+#                     clip_denoised=False,
+#                     denoised_fn=None,
+#                     model_kwargs={},
+#                     device=engine.state.device,
+#                     progress=False,
+#                 )
+#             else:
+#                 out = engine.diffusion.ddim_sample_loop_known(
+#                     engine.network,
+#                     (batchsize, 2, *inputs.shape[2:]),
+#                     img_cond,
+#                     step=engine.diffusion.num_timesteps,
+#                     noise=None,
+#                     clip_denoised=False,
+#                     denoised_fn=None,
+#                     model_kwargs={},
+#                     device=engine.state.device,
+#                     progress=False,
+#                 )
+#             sample, *_ = out
+#             votes.append(sample[:, -1, :, :])
+
+#     final_vote = staple(torch.stack(votes, dim=0)).squeeze(0)
+#     engine.state.output["y_pred"] = final_vote
+#     engine.state.output[Keys.PRED] = final_vote
+
+#     # fire metric events
+#     engine.fire_event(IterationEvents.FORWARD_COMPLETED)
+#     engine.fire_event(IterationEvents.MODEL_COMPLETED)
+#     return engine.state.output
+
+
+def train_step(engine, batchdata):
+    """
+    This will replace your DiffusionTrainer._iteration.
+    Expects these attributes on `engine`:
+      - engine.network
+      - engine.diffusion
+      - engine.schedule_sampler
+      - engine.optimizer
+      - engine.mp_trainer
+      - engine.optim_set_to_none (bool)
+    """
+    # 1) prepare
+    images, labels = engine.prepare_batch(
+        batchdata, engine.state.device, engine.non_blocking
+    )
+    engine.network.train()
+    engine.mp_trainer.zero_grad()
+
+    # 2) sample timesteps & weights
+    t, weights = engine.schedule_sampler.sample(labels.shape[0], engine.state.device)
+
+    # 3) compute the diffusion loss
+    combined = torch.cat((labels, images), dim=1)
+    with engine.network.no_sync():
+        loss_dict, sample = engine.diffusion.training_losses_segmentation(
+            engine.network, None, combined, t, model_kwargs={}
+        )
+    if isinstance(engine.schedule_sampler, LossAwareSampler):
+        engine.schedule_sampler.update_with_local_losses(t, loss_dict["loss"].detach())
+
+    # weighted combination
+    loss = (loss_dict["loss"] * weights + loss_dict["loss_cal"] * 10).mean()
+
+    # 4) backward + step
+    engine.optimizer.zero_grad(set_to_none=engine.optim_set_to_none)
+    engine.mp_trainer.backward(loss)
+    engine.mp_trainer.optimize(engine.optimizer)
+
+    # 5) return whatever you need in metrics/handlers
+    #    here we return a dict so StatsHandler can pick out "loss"
+    return {"loss": loss, "pred": sample, "label": labels}
+
+
+def eval_step(engine, batchdata):
+    """
+    This replaces your DiffusionEvaluator._iteration.
+    Expects these attrs on `engine`:
+      - engine.network
+      - engine.diffusion
+      - engine.schedule_sampler
+      - engine.n_rounds
+      - engine.ddim
+    """
+    # 1) prepare
+    inputs, targets = engine.prepare_batch(
+        batchdata, engine.state.device, engine.non_blocking
+    )
+
+    # 2) noisy condition
+    noise = torch.randn_like(inputs[:, :1, ...])
+    cond = torch.cat((inputs, noise), dim=1)
+
+    # 3) repeated sampling
+    votes = []
+    with torch.no_grad():
+        for _ in range(engine.n_rounds):
+            if not engine.ddim:
+                out = engine.diffusion.p_sample_loop_known(
+                    engine.network,
+                    (inputs.shape[0], 2, *inputs.shape[2:]),
+                    cond,
+                    step=20,
+                    noise=None,
+                    clip_denoised=False,
+                    model_kwargs={},
+                    device=engine.state.device,
+                    progress=False,
+                )
+            else:
+                out = engine.diffusion.ddim_sample_loop_known(
+                    engine.network,
+                    (inputs.shape[0], 2, *inputs.shape[2:]),
+                    cond,
+                    step=engine.diffusion.num_timesteps,
+                    noise=None,
+                    clip_denoised=False,
+                    model_kwargs={},
+                    device=engine.state.device,
+                    progress=False,
+                )
+            sample, *_ = out
+            votes.append(sample[:, -1, :, :])
+
+    pred = staple(torch.stack(votes, dim=0)).squeeze(0)
+
+    # 4) return a dict with keys "pred" and "label"
+    #    MONAI's Evaluator will pick those up for metrics
+    return {"image": inputs, "y_pred": pred, "y": targets}
 
 
 # endregion
@@ -526,7 +731,7 @@ def get_dataloaders(config, aim_logger, rank):
         for line in f:
             data = json.loads(line)
             train_files.append({Keys.IMAGE: data["image"], Keys.LABEL: data["mask"]})
-    train_files = train_files[:50]
+    train_files = train_files[:16]
 
     # train_files = train_files
     if aim_logger is not None and rank == 0:
@@ -547,9 +752,6 @@ def get_dataloaders(config, aim_logger, rank):
         )
         logging.info(f"Validation files length: {len(val_files)}")
 
-
-
-    
     train_transforms = Compose(
         [
             LoadImaged(keys=[Keys.IMAGE, Keys.LABEL]),
@@ -612,6 +814,7 @@ def get_dataloaders(config, aim_logger, rank):
         num_workers=config.data.num_workers,
         collate_fn=list_data_collate,
         pin_memory=torch.cuda.is_available(),
+        persistent_workers=True,
     )
     # create a validation data loader
     val_ds = monai.data.Dataset(data=val_files, transform=val_transforms)
@@ -621,6 +824,7 @@ def get_dataloaders(config, aim_logger, rank):
         num_workers=config.data.num_workers,
         collate_fn=list_data_collate,
         pin_memory=torch.cuda.is_available(),
+        persistent_workers=True,
     )
     return train_loader, val_loader
 
@@ -814,7 +1018,7 @@ def attach_aim_handlers(trainer, val_evaluator, aim_logger, val_loader, rank):
             val_evaluator,
             log_handler=AimIgnite2DImageHandler(
                 "Prediction",
-                output_transform=from_engine([Keys.IMAGE, Keys.LABEL, Keys.PRED]),
+                output_transform=from_engine(["image", "y", "y_pred"]),
                 global_step_transform=global_step_from_engine(trainer),
             ),
             # event_name=Events.ITERATION_COMPLETED(
@@ -858,6 +1062,20 @@ def start_aim_ui_server(config, rank=0):
         logging.error(f"Failed to start Aim UI server: {e}")
         logging.error(f"Please start the Aim UI server manually using 'aim up --port 43800 --repo {config.train.logging.aim_repo}'")
 
+
+def attach_handlers(trainer, val_evaluator, net, opt, ema_params, config, aim_logger, val_loader, rank):
+    """
+    Attach various handlers to the trainer and evaluator.
+    """
+    if rank == 0:
+        logging.info(f"[Rank {rank}] Attaching handlers")
+    
+    attach_checkpoint_handler(trainer, net, opt, ema_params, config, rank)
+    attach_ema_update(trainer, net, ema_params, config)
+    attach_ema_validation(trainer, net, ema_params, val_evaluator, val_loader, config)
+    attach_stats_handlers(trainer, val_evaluator, config, rank)
+    # attach_early_stopping(val_evaluator, trainer, config, rank)
+    attach_aim_handlers(trainer, val_evaluator, aim_logger, val_loader, rank)
 # endregion
 
 
@@ -884,51 +1102,85 @@ def _distributed_run(rank, config):
     # ema_params = copy.deepcopy(list(net.parameters()))
     ema_params = [p.detach().clone() for p in net.parameters()]
 
-    trainer = DiffusionTrainer(
+    # trainer = Trainer(
+    #     device=device,
+    #     max_epochs=config.train.epochs,
+    #     train_data_loader=train_loader,
+    #     network=net,
+    #     optimizer=opt,
+    #     prepare_batch=prepare_batch,
+    #     diffusion=diffusion,
+    #     schedule_sampler=schduler,
+    # )
+    trainer = Trainer(
         device=device,
         max_epochs=config.train.epochs,
-        train_data_loader=train_loader,
-        network=net,
-        optimizer=opt,
+        data_loader=train_loader,
         prepare_batch=prepare_batch,
-        diffusion=diffusion,
-        schedule_sampler=schduler,
+        iteration_update=train_step,
+        # key_metric={'loss': None},             # or your dict of Metrics
+        additional_metrics=None,
+        metric_cmp_fn=default_metric_cmp_fn,
     )
 
-    post_pred = AsDiscreted(keys=Keys.PRED, argmax=True, to_onehot=2)
+    # 2) Attach the objects your step functions need
+    trainer.network           = net
+    trainer.optimizer         = opt
+    trainer.diffusion         = diffusion
+    trainer.schedule_sampler  = schduler
+    trainer.mp_trainer        = MixedPrecisionTrainer(
+                                model=net,
+                                use_fp16=False,
+                                fp16_scale_growth=config.train.amp_kwargs.fp16_scale_growth,
+                                )
+    trainer.optim_set_to_none = config.train.optim_set_to_none
+
+    # post_pred = AsDiscreted(keys=Keys.PRED, argmax=True, to_onehot=2)
+    post_pred = AsDiscreted(keys="pred", argmax=True, to_onehot=2)
+    post_label = AsDiscreted(keys="label", to_onehot=2)
+
     metrics = {"Mean Dice": MeanDice(include_background=False)}
 
-    val_evaluator = DiffusionEvaluator(
-        device=device,
-        val_data_loader=val_loader,
-        diffusion=diffusion,
-        network=net,
-        prepare_batch= prepare_batch,
-        schedule_sampler=schduler,
-        postprocessing=post_pred,
-        key_val_metric=metrics,
-        ddim=config.model.ddim,
-    )
+    # val_evaluator = Evaluator(
+    #     device=device,
+    #     val_data_loader=val_loader,
+    #     diffusion=diffusion,
+    #     network=net,
+    #     prepare_batch= prepare_batch,
+    #     schedule_sampler=schduler,
+    #     postprocessing=post_pred,
+    #     key_val_metric=metrics,
+    #     ddim=config.model.ddim,
+    # )
     # logging.info(f"[Rank {rank}] Validation evaluator created")
 
-    attach_checkpoint_handler(trainer, net, opt, ema_params, config, rank)
+    val_evaluator = Evaluator(
+        device=device,
+        val_data_loader=val_loader,
+        prepare_batch=prepare_batch,
+        iteration_update=eval_step,
+        postprocessing=[post_label, post_pred],
+        key_val_metric=metrics,
+    )
 
-    logging.info(f"[Rank {rank}] Checkpoint handler attached")
+    # 4) Attach objects needed during eval
+    val_evaluator.network          = net
+    val_evaluator.diffusion        = diffusion
+    val_evaluator.schedule_sampler = schduler
+    val_evaluator.n_rounds         = config.model.n_rounds
+    val_evaluator.ddim             = config.model.ddim
 
-    attach_stats_handlers(trainer, val_evaluator, config, rank)
-
-    attach_ema_update(trainer, net, ema_params, config)
-    logging.info(f"[Rank {rank}] EMA update handler attached")
-
-    attach_ema_validation(trainer, net, ema_params, val_evaluator, val_loader, config)
-
-    # attach_validation(trainer, val_evaluator, config)
-
-    attach_aim_handlers(trainer, val_evaluator, aim_logger, val_loader, rank)
-
-    logging.info(f"[Rank {rank}] Handlers attached")
-    # val_evaluator.run()
-
+    attach_handlers(
+        trainer,
+        val_evaluator,
+        net,
+        opt,
+        ema_params,
+        config,
+        aim_logger,
+        val_loader,
+        rank
+    )
     # Add barrier to ensure all processes are ready before starting training
     idist.utils.barrier()
 
@@ -936,6 +1188,7 @@ def _distributed_run(rank, config):
         logging.info(f"[Rank {rank}] Starting training for {config.train.epochs} epochs")
         logging.info(f"[Rank {rank}] Training on {len(train_loader.dataset)} training samples")
         logging.info(f"[Rank {rank}] Validation on {len(val_loader.dataset)} validation samples")
+
     with TorchProfiler(subdir="trainer_run"):
         trainer.run()
 
