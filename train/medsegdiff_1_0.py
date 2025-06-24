@@ -17,7 +17,6 @@ from omegaconf import OmegaConf
 import torch
 import torch.optim as optim
 from torch.optim.optimizer import Optimizer
-from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -25,6 +24,7 @@ from ignite.engine import Events, Engine, EventEnum
 from ignite.handlers import EarlyStopping, ModelCheckpoint, global_step_from_engine
 from ignite.metrics import Metric
 import ignite.distributed as idist
+from ignite.distributed.auto import auto_dataloader, auto_model, auto_optim
 
 
 import monai
@@ -44,6 +44,7 @@ from monai.transforms import (
     RandSpatialCropSamplesd,
     RandCropByPosNegLabeld,
     SplitDimd,
+    Lambdad,
 )
 from monai.engines.utils import (
     IterationEvents,
@@ -76,17 +77,17 @@ import subprocess
 
 # region utils (EMA update, get_args, update_ema)
 
-def update_ema(target_params, source_params, rate=0.99):
-    """
-    Update target parameters to be closer to those of source parameters using
-    an exponential moving average.
+# def update_ema(target_params, source_params, rate=0.99):
+#     """
+#     Update target parameters to be closer to those of source parameters using
+#     an exponential moving average.
 
-    :param target_params: the target parameter sequence.
-    :param source_params: the source parameter sequence.
-    :param rate: the EMA rate (closer to 1 means slower).
-    """
-    for targ, src in zip(target_params, source_params):
-        targ.detach().mul_(rate).add_(src, alpha=1 - rate)
+#     :param target_params: the target parameter sequence.
+#     :param source_params: the source parameter sequence.
+#     :param rate: the EMA rate (closer to 1 means slower).
+#     """
+#     for targ, src in zip(target_params, source_params):
+#         targ.detach().mul_(rate).add_(src, alpha=1 - rate)
 
 
 def get_args():
@@ -512,8 +513,11 @@ class GetRandomSlice(monai.transforms.Transform):
 
         return {Keys.IMAGE: image_slice, Keys.LABEL: label_slice}
 
+def threshold_label(x: torch.Tensor) -> torch.Tensor:
+    return (x > 0).int()
+
 @profile_block("get_dataloaders")
-def get_dataloaders(config, aim_logger, rank, world_size):
+def get_dataloaders(config, aim_logger, rank):
     train_files = []
     val_files = []
 
@@ -531,7 +535,6 @@ def get_dataloaders(config, aim_logger, rank, world_size):
         )
         logging.info(f"Training files length: {len(train_files)}")
 
-    
     with open(config.data.val_jsonl, "r") as f:
         for line in f:
             data = json.loads(line)
@@ -545,6 +548,8 @@ def get_dataloaders(config, aim_logger, rank, world_size):
         logging.info(f"Validation files length: {len(val_files)}")
 
 
+
+    
     train_transforms = Compose(
         [
             LoadImaged(keys=[Keys.IMAGE, Keys.LABEL]),
@@ -558,10 +563,8 @@ def get_dataloaders(config, aim_logger, rank, world_size):
                 keys=[Keys.IMAGE, Keys.LABEL],
                 axcodes=config.data.orientation,
             ),
-            lambda data: {
-                Keys.IMAGE: data[Keys.IMAGE],
-                Keys.LABEL: (data[Keys.LABEL] > 0).int(),
-            },  # Ensure the data is in the correct format
+            Lambdad(keys=[Keys.LABEL], func=threshold_label),
+             # Ensure the data is in the correct format
             # SplitDimd(
             #     keys=[Keys.IMAGE, Keys.LABEL],
             #     dim=-1,
@@ -597,31 +600,24 @@ def get_dataloaders(config, aim_logger, rank, world_size):
                 keys=[Keys.IMAGE, Keys.LABEL],
                 spatial_size=config.data.roi_size,
             ),
+            Lambdad(keys=[Keys.LABEL], func=threshold_label),
         ]
     )
 
     # create a training data loader
     train_ds = monai.data.Dataset(data=train_files, transform=train_transforms)
-    train_sampler = DistributedSampler(
-        train_ds, num_replicas=world_size, rank=rank, shuffle=True
-    )
-    train_loader = DataLoader(
+    train_loader = auto_dataloader(
         train_ds,
         batch_size=config.data.batch_size,
-        sampler=train_sampler,
         num_workers=config.data.num_workers,
         collate_fn=list_data_collate,
         pin_memory=torch.cuda.is_available(),
     )
     # create a validation data loader
     val_ds = monai.data.Dataset(data=val_files, transform=val_transforms)
-    val_sampler = DistributedSampler(
-        val_ds, num_replicas=world_size, rank=rank, shuffle=False
-    )
-    val_loader = DataLoader(
+    val_loader = auto_dataloader(
         val_ds,
         batch_size=config.data.val_batch_size,
-        sampler=val_sampler,
         num_workers=config.data.num_workers,
         collate_fn=list_data_collate,
         pin_memory=torch.cuda.is_available(),
@@ -641,8 +637,10 @@ def build_model(config, rank):
         weight_decay=config.train.optimizer.weight_decay,
     )
     
-    dist.barrier()
-    net = DDP(net, device_ids=[rank], broadcast_buffers=False, find_unused_parameters=False)
+    # dist.barrier()
+    # net = DDP(net, device_ids=[rank], broadcast_buffers=False, find_unused_parameters=False)
+    net = auto_model(net)
+    opt = auto_optim(opt)
 
     if config.train.resume is not None:
         logging.info(f"[Rank {rank}] Loading model from {config.train.resume}")
@@ -731,23 +729,28 @@ def attach_checkpoint_handler(trainer, net, opt, ema_params, config, rank):
 
 def attach_ema_update(trainer, net, ema_params, config):
     def update_(engine):
-        
+
         # logging.info(f"[Rank {engine.state.rank}] Updating EMA parameters")
-        
-        for p_ema, p in zip(ema_params[0], net.parameters()):
-            update_ema(p_ema, p, rate=config.model.ema_rate)
-    
+
+        for p_ema, p in zip(ema_params, net.parameters()):
+            # update_ema(p_ema, p, rate=config.model.ema_rate)
+            p_ema.mul_(config.model.ema_rate).add_(p, alpha=1 - config.model.ema_rate)
 
     trainer.add_event_handler(Events.ITERATION_COMPLETED(every=1), update_)
 
 
 def attach_ema_validation(trainer, net, ema_params, val_evaluator, val_loader, config):
     def validate_with_ema(engine):
-        original_state = copy.deepcopy(net.state_dict())
-        for p, p_ema in zip(net.parameters(), ema_params[0]):
+        # save original
+        orig = {n: p.detach().clone() for n, p in net.named_parameters()}
+        # copy EMA weights into the model
+        for p, p_ema in zip(net.parameters(), ema_params):
             p.data.copy_(p_ema.data)
+        # run validation
         val_evaluator.run()
-        net.load_state_dict(original_state)
+        # restore original weights
+        for n, p in net.named_parameters():
+            p.data.copy_(orig[n])
 
     trainer.add_event_handler(
         Events.EPOCH_COMPLETED(every=config.train.eval.validation_interval),
@@ -784,8 +787,8 @@ def attach_early_stopping(val_evaluator, trainer, config, rank):
 
 
 def attach_aim_handlers(trainer, val_evaluator, aim_logger, val_loader, rank):
-    # if rank != 0 or aim_logger is None:
-    #     return
+    if rank != 0 or aim_logger is None:
+        return
     try:
         # Output loss
         for tag, event in [
@@ -857,38 +860,32 @@ def start_aim_ui_server(config, rank=0):
 
 # endregion
 
-def main(rank, world_size):
-    torch.cuda.set_device(rank)
-    dist.init_process_group("nccl", init_method='env://', rank=rank, world_size=world_size)
 
-    config = get_args()
+def _distributed_run(rank, config):
+    device = idist.device()                          # e.g. 'cuda:0'
+    # rank = idist.get_rank()
+    world_size = idist.get_world_size()
 
-    config.train.device = f"cuda:{rank}"
+    logging.info(f"[Rank {rank}] Running on device: {device}, world size: {world_size}")
 
-    log_config(config, rank)
-    torch.random.manual_seed(config.train.seed)
+    # log_config(config, rank)
+    # idist.seed_everything(config.train.seed)
 
+    aim_logger = None
     if rank == 0:
-        try:
-            aim_logger = get_aim_logger(config)
-        except Exception as e:
-            logging.exception("[Rank 0] Failed to initialize Aim logger")
-            aim_logger = None
-    else:
-        aim_logger = None
+        aim_logger = get_aim_logger(config)
+        start_aim_ui_server(config, rank)
+    init_profiler(config, aim_logger, rank)
 
-    init_profiler(config, aim_logger.experiment, rank)
-    
-    start_aim_ui_server(config, rank)
-    
-    train_loader, val_loader = get_dataloaders(config, aim_logger, rank, world_size)
+    train_loader, val_loader = get_dataloaders(config, aim_logger, rank)
 
     net, opt, diffusion, schduler = build_model(config, rank)
 
-    ema_params = [copy.deepcopy(list(net.parameters())) for _ in range(1)]
+    # ema_params = copy.deepcopy(list(net.parameters()))
+    ema_params = [p.detach().clone() for p in net.parameters()]
 
     trainer = DiffusionTrainer(
-        device=config.train.device,
+        device=device,
         max_epochs=config.train.epochs,
         train_data_loader=train_loader,
         network=net,
@@ -902,7 +899,7 @@ def main(rank, world_size):
     metrics = {"Mean Dice": MeanDice(include_background=False)}
 
     val_evaluator = DiffusionEvaluator(
-        device=config.train.device,
+        device=device,
         val_data_loader=val_loader,
         diffusion=diffusion,
         network=net,
@@ -933,8 +930,8 @@ def main(rank, world_size):
     # val_evaluator.run()
 
     # Add barrier to ensure all processes are ready before starting training
-    dist.barrier()
-    
+    idist.utils.barrier()
+
     if rank == 0:
         logging.info(f"[Rank {rank}] Starting training for {config.train.epochs} epochs")
         logging.info(f"[Rank {rank}] Training on {len(train_loader.dataset)} training samples")
@@ -942,11 +939,13 @@ def main(rank, world_size):
     with TorchProfiler(subdir="trainer_run"):
         trainer.run()
 
-    dist.destroy_process_group()
-
-
 if __name__ == "__main__":
-    world_size = torch.cuda.device_count()
-    rank = int(os.environ["LOCAL_RANK"])  # torchrun provides this env var
-    logging.info(f"Running on rank {rank} with world size {world_size}")
-    main(rank, world_size)
+    config = get_args()
+    # world_size = torch.cuda.device_count()
+    # rank = int(os.environ["LOCAL_RANK"])  # torchrun provides this env var
+    # logging.info(f"Running on rank {rank} with world size {world_size}")
+    # main(rank, world_size)
+    
+    with idist.Parallel(backend="nccl", nproc_per_node=torch.cuda.device_count()) as parallel:
+        parallel.run(_distributed_run, config)  # :contentReference[oaicite:2]{index=2}
+    # _distributed_run(config)

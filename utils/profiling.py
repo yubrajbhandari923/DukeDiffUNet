@@ -38,12 +38,14 @@ def profile_block(name):
                 result = fn(*args, **kwargs)
                 elapsed = time.time() - start
                 # run = aim.Run.active_run()
-                run = _GLOBAL_AIM_RUN
+                run = _GLOBAL_AIM_RUN.experiment
+                
                 if run:
                     run.track(float(elapsed), name=name, context={"type": "timing"})
                 else:
                     print(f"Warning: No active Aim run found. Profiling data for '{name}' not logged.")
                 return result
+            
             else:
                 # If not rank 0, just call the function without profiling
                 return fn(*args, **kwargs)

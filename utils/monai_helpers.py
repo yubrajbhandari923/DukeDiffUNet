@@ -5,7 +5,7 @@ import torch
 import json
 
 # from ignite.handlers.base_logger import BaseHandler
-from aim import Figure
+from aim import Figure, Image
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -207,19 +207,16 @@ class AimIgnite2DImageHandler:
                 )
                 
             logging.info(f"Unique values in label: {torch.unique(lbl)}, Unique values in pred: {torch.unique(prd)}")
-            img_data = img.cpu().numpy()
-            label_data = lbl.cpu().numpy()
-            pred_data = prd.cpu().numpy()
 
             # fig = plot_2d_images(img_name, img_data, label_data, pred_data)
             fig = plot_image_label_pred(
-                img_name, img_data, label_data, pred_data
+                img_name, img, lbl, prd
             )
             if self.global_step_transform is not None:
                 global_step = self.global_step_transform(engine, Events.EPOCH_COMPLETED)
             else:
                 global_step = engine.state.get_event_attrib_value(event_name)
-            logger.experiment.track(Figure(fig), name=tag_name, step=global_step)
+            logger.experiment.track(Image(fig), name=tag_name, step=global_step)
             AimIgnite2DImageHandler.plotted_tags.add(tag_name)
 
 
@@ -263,15 +260,6 @@ def plot_image_label_pred(title, image, label, pred):
     """
     Plot image, label, and prediction side by side.
     """
-    image = image.squeeze()
-    label = label.squeeze()
-    pred = pred.squeeze()
-
-    # log shapes
-    logging.info(
-        f"Image shape: {image.shape}, Label shape: {label.shape}, Prediction shape: {pred.shape}"
-    )
-
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
     axes[0].imshow(image.cpu().numpy(), cmap="gray")
     axes[0].set_title("Image")
