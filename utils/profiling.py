@@ -9,10 +9,11 @@ import torch
 _GLOBAL_PROF_CFG = None
 
 
-def init_profiler(cfg, rank=0):
-    global _GLOBAL_PROF_CFG, _GLOBAL_PROF_RANK
+def init_profiler(cfg, aimRun, rank=0):
+    global _GLOBAL_PROF_CFG, _GLOBAL_PROF_RANK, _GLOBAL_AIM_RUN
     _GLOBAL_PROF_CFG = cfg
     _GLOBAL_PROF_RANK = rank
+    _GLOBAL_AIM_RUN = aimRun
 
 
 def profile_block(name):
@@ -36,10 +37,16 @@ def profile_block(name):
                 start = time.time()
                 result = fn(*args, **kwargs)
                 elapsed = time.time() - start
-                run = aim.Run.active_run()
+                # run = aim.Run.active_run()
+                run = _GLOBAL_AIM_RUN
                 if run:
-                    run.track(elapsed, name=name, context={"type": "timing"})
+                    run.track(float(elapsed), name=name, context={"type": "timing"})
+                else:
+                    print(f"Warning: No active Aim run found. Profiling data for '{name}' not logged.")
                 return result
+            else:
+                # If not rank 0, just call the function without profiling
+                return fn(*args, **kwargs)
 
         return wrapper
     return decorator

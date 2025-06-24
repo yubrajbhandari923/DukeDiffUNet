@@ -24,6 +24,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from ignite.engine import Events, Engine, EventEnum
 from ignite.handlers import EarlyStopping, ModelCheckpoint, global_step_from_engine
 from ignite.metrics import Metric
+import ignite.distributed as idist
+
 
 import monai
 from monai.data import DataLoader, Dataset
@@ -68,7 +70,9 @@ from model.medsegdiffv2 import MedSegDiffModel
 # from model.medsegdiffv2.guided_diffusion.custom_dataset_loader import CustomDataset3D
 
 from utils.profiling import profile_block, TorchProfiler, init_profiler
+from utils.monai_helpers import AimIgnite2DImageHandler
 
+import subprocess
 
 # region utils (EMA update, get_args, update_ema)
 
@@ -243,7 +247,7 @@ class DiffusionEvaluator(Evaluator):
         network,
         schedule_sampler,
         prepare_batch=default_prepare_batch,
-        n_rounds=3,
+        n_rounds=1,
         major_vote_number=9,
         postprocessing=None,
         key_val_metric=None,
@@ -263,7 +267,7 @@ class DiffusionEvaluator(Evaluator):
             postprocessing=postprocessing,
             key_val_metric=key_val_metric,
             additional_metrics=None,
-            metric_cmp_fn=None,
+            metric_cmp_fn= default_metric_cmp_fn,
             val_handlers=val_handlers,
             amp=amp,
             mode=mode,
@@ -276,6 +280,7 @@ class DiffusionEvaluator(Evaluator):
         self.major_vote = major_vote_number
         self.ddim = ddim
         self.use_fp16 = use_fp16
+
 
     @profile_block("eval_iteration")
     def _iteration(self, engine, batchdata):
@@ -293,7 +298,6 @@ class DiffusionEvaluator(Evaluator):
         }
 
         batchsize = inputs.shape[0]
-        
 
         # targets = torch.cat((targets, inputs), dim=1)  # Concatenate inputs and targets if needed
         noise = torch.randn_like(inputs[:, :1, ...])
@@ -323,7 +327,8 @@ class DiffusionEvaluator(Evaluator):
                     x = self.diffusion.p_sample_loop_known(
                         self.network,
                         (batchsize, 2, *inputs.shape[2:]), image,
-                        step = self.diffusion.num_timesteps,
+                        # step = self.diffusion.num_timesteps,
+                        step = 20, # Using DPMSolver++
                         noise=None,
                         clip_denoised=False,
                         denoised_fn=None,
@@ -346,7 +351,7 @@ class DiffusionEvaluator(Evaluator):
 
                 sample, x_noisy, org, cal, cal_out = x
 
-                co = torch.tensor(cal_out)
+                # co = cal_out
                 votes.append(sample[:, -1, :, :])
                 # torch.cuda.synchronize()
 
@@ -361,6 +366,11 @@ class DiffusionEvaluator(Evaluator):
         # wrap in MetaTensor to preserve spatial metadata
         # SaveImage will read metadata from inputs
         engine.state.output[Keys.PRED] = final_vote
+        
+        # self.plot_image_label_pred(
+        #     inputs, targets, final_vote,
+        #     title=f"Rank {engine.state.rank}_Epoch_{engine.state.epoch}_Iteration_{engine.state.iteration}"
+        # )
 
         # fire events for metrics
         engine.fire_event(IterationEvents.FORWARD_COMPLETED)
@@ -396,7 +406,7 @@ def get_aim_logger(config):
     for tag in config.tags:
         aim_logger.experiment.add_tag(tag)
 
-    aim_logger.experiment.add_tag(config.name)
+    # aim_logger.experiment.add_tag(config.name)
 
     aim_logger.experiment.description = config.description
     aim_logger.log_params(OmegaConf.to_container(config, resolve=True))
@@ -415,34 +425,91 @@ def get_aim_logger(config):
 class GetRandomSlice(monai.transforms.Transform):
     """
     A custom transform to get a random slice from a 3D image.
+    pos and neg are the proportions of samples with and without labels present.
+    axis is the axis along which to slice the image.
     """
-    def __init__(self, axis):
+    def __init__(self, axis, pos=10, neg=1):
         super().__init__()
         self.axis = axis
-        
+        self.pos = pos
+        self.neg = neg
+
+        if self.axis == -1:
+            self.axis = 3
+        elif self.axis == -2:
+            self.axis = 2
+        elif self.axis == -3:
+            self.axis = 1
+
+        if self.axis not in [1, 2, 3]:
+            raise ValueError("Axis must be 1 (depth), 2 (height), or 3 (width) for 4D tensors or -1, -2, -3 for negative indexing.")
+
     def __call__(self, data):
         image = data[Keys.IMAGE]
         label = data[Keys.LABEL]
-        
+
         if image.ndim != 4 or label.ndim != 4:
             raise ValueError("Input images must be 4D tensors ((batch), channel, depth, height, width)")
+        # Get the shape of the image
+        channels, depth, height, width = image.shape        
 
-        # Get a random slice index
-        slice_index = np.random.randint(image.shape[self.axis])
-        
-        # Select the slice
-        if self.axis == 1 or self.axis == -3:
+        # Randomly select a slice index along the specified axis
+        if self.axis == 1:  # Slicing along the depth axis
+            # Get the slices with and without labels present
+            pos_indices = np.where(label.sum(axis=(0, 2, 3)) > 0)[0]
+            neg_indices = np.where(label.sum(axis=(0, 2, 3)) == 0)[0]
+
+            if len(pos_indices) == 0 or len(neg_indices) == 0:
+                logging.warning(f"No positive or negative samples found in {image.meta['filename_or_obj']}. Using all slices.")
+                pos_indices = np.arange(depth)
+                neg_indices = np.arange(depth)
+
+        elif self.axis == 2:  # Slicing along the height axis
+            # Get the slices with and without labels present
+            pos_indices = np.where(label.sum(axis=(0, 1, 3)) > 0)[0]
+            neg_indices = np.where(label.sum(axis=(0, 1, 3)) == 0)[0]
+            if len(pos_indices) == 0 or len(neg_indices) == 0:
+                logging.warning(
+                    f"No positive or negative samples found in  {image.meta['filename_or_obj']}. Using all slices."
+                )
+                pos_indices = np.arange(height)
+                neg_indices = np.arange(height)
+
+        elif self.axis == 3:  # Slicing along the width axis
+            # Get the slices with and without labels present
+            pos_indices = np.where(label.sum(axis=(0, 1, 2)) > 0)[0]
+            neg_indices = np.where(label.sum(axis=(0, 1, 2)) == 0)[0]
+
+            if len(pos_indices) == 0 or len(neg_indices) == 0:
+                logging.warning(f"No positive or negative samples found in  {image.meta['filename_or_obj']} Using all slices.")
+                pos_indices = np.arange(width)
+                neg_indices = np.arange(width)
+        else:
+            raise ValueError("Invalid axis specified. Must be 0, 1, or 2.")
+
+        if len(pos_indices) == 0 or len(neg_indices) == 0:
+            # raise ValueError("No positive or negative samples found in the dataset")
+            logging.warning("No positive or negative samples found in the dataset. Using all slices.")
+
+        # Randomly select a slice index with a probability based on pos and neg
+        if np.random.rand() < (self.pos / (self.pos + self.neg)):
+            slice_index = np.random.choice(pos_indices)
+        else:
+            slice_index = np.random.choice(neg_indices)
+
+        # Create slices for the image and label
+        if self.axis == 1:  # Slicing along the depth axis
             image_slice = image[:, slice_index, :, :]
             label_slice = label[:, slice_index, :, :]
-        elif self.axis == 2 or self.axis == -2:
+        elif self.axis == 2:  # Slicing along the height axis
             image_slice = image[:, :, slice_index, :]
             label_slice = label[:, :, slice_index, :]
-        elif self.axis == 3 or self.axis == -1:
+        elif self.axis == 3:  # Slicing along the width axis
             image_slice = image[:, :, :, slice_index]
             label_slice = label[:, :, :, slice_index]
         else:
-            raise ValueError("Axis must be 1, 2, or 3 (or -3, -2, -1 for negative indexing)")
-        
+            raise ValueError("Invalid axis specified. Must be 0, 1, or 2.")
+
         return {Keys.IMAGE: image_slice, Keys.LABEL: label_slice}
 
 @profile_block("get_dataloaders")
@@ -455,9 +522,9 @@ def get_dataloaders(config, aim_logger, rank, world_size):
         for line in f:
             data = json.loads(line)
             train_files.append({Keys.IMAGE: data["image"], Keys.LABEL: data["mask"]})
-    # train_files = train_files[:2]
+    train_files = train_files[:50]
 
-    train_files = train_files
+    # train_files = train_files
     if aim_logger is not None and rank == 0:
         aim_logger.experiment.log_info(
             f"Training files {json.dumps(train_files, indent=2)}"
@@ -469,7 +536,7 @@ def get_dataloaders(config, aim_logger, rank, world_size):
         for line in f:
             data = json.loads(line)
             val_files.append({Keys.IMAGE: data["image"], Keys.LABEL: data["mask"]})
-    # val_files = val_files[:2]
+    val_files = val_files[:2]
 
     if aim_logger is not None and rank == 0:    
         aim_logger.experiment.log_info(
@@ -491,6 +558,10 @@ def get_dataloaders(config, aim_logger, rank, world_size):
                 keys=[Keys.IMAGE, Keys.LABEL],
                 axcodes=config.data.orientation,
             ),
+            lambda data: {
+                Keys.IMAGE: data[Keys.IMAGE],
+                Keys.LABEL: (data[Keys.LABEL] > 0).int(),
+            },  # Ensure the data is in the correct format
             # SplitDimd(
             #     keys=[Keys.IMAGE, Keys.LABEL],
             #     dim=-1,
@@ -549,7 +620,7 @@ def get_dataloaders(config, aim_logger, rank, world_size):
     )
     val_loader = DataLoader(
         val_ds,
-        batch_size=config.data.batch_size,
+        batch_size=config.data.val_batch_size,
         sampler=val_sampler,
         num_workers=config.data.num_workers,
         collate_fn=list_data_collate,
@@ -564,13 +635,22 @@ def build_model(config, rank):
     segdiff = MedSegDiffModel(args=OmegaConf.to_container(config.model, resolve=True))
     net = segdiff.get_model().to(rank)
 
+    opt = optim.AdamW(
+        net.parameters(),
+        config.train.optimizer.lr,
+        weight_decay=config.train.optimizer.weight_decay,
+    )
+    
     dist.barrier()
     net = DDP(net, device_ids=[rank], broadcast_buffers=False, find_unused_parameters=False)
 
     if config.train.resume is not None:
         logging.info(f"[Rank {rank}] Loading model from {config.train.resume}")
-        state_dict = torch.load(config.train.resume, map_location=rank)
-        net.load_state_dict(state_dict["model"], strict=False)
+        state_dict = torch.load(config.train.resume, map_location=f"cuda:{rank}")
+        net.load_state_dict(state_dict["network"], strict=False)
+        opt.load_state_dict(state_dict["optimizer"])
+        epoch = state_dict.get("epoch", str(config.train.epochs).split(".")[0].split("_")[-1])
+        
         logging.info(f"[Rank {rank}] Model loaded successfully")
     else:
         logging.info(f"[Rank {rank}] No pre-trained model to load, starting from scratch")
@@ -580,11 +660,6 @@ def build_model(config, rank):
     diffusion = segdiff.get_diffusion()
     schedule_sampler = segdiff.get_schedule_sampler(config.model.schedule_sampler, config.model.diffusion_steps)
 
-    opt = optim.AdamW(
-        net.parameters(),
-        config.train.optimizer.lr,
-        weight_decay=config.train.optimizer.weight_decay,
-    )
     return net, opt, diffusion, schedule_sampler
 
 def prepare_batch(batch, device=None, non_blocking=True):
@@ -625,7 +700,6 @@ def get_post_processing():
 
 # region Handlers
 
-
 def attach_checkpoint_handler(trainer, net, opt, ema_params, config, rank):
     # if rank != 0:
     #     return
@@ -647,7 +721,7 @@ def attach_checkpoint_handler(trainer, net, opt, ema_params, config, rank):
         # logging.info(f"[Rank {rank}] Checkpoint handler created")
         trainer.add_event_handler(
             # Events.EPOCH_COMPLETED, checkpoint_handler, {"network": net, "optimizer": opt, "ema_params": ema_params}
-            Events.EPOCH_COMPLETED, checkpoint_handler, {"network": net, "optimizer": opt}
+            Events.EPOCH_COMPLETED(every=config.train.save_interval), checkpoint_handler, {"network": net, "optimizer": opt}
         )
         logging.info(f"[Rank {rank}] Checkpoint handler attached successfully")
         
@@ -710,8 +784,8 @@ def attach_early_stopping(val_evaluator, trainer, config, rank):
 
 
 def attach_aim_handlers(trainer, val_evaluator, aim_logger, val_loader, rank):
-    if rank != 0 or aim_logger is None:
-        return
+    # if rank != 0 or aim_logger is None:
+    #     return
     try:
         # Output loss
         for tag, event in [
@@ -732,8 +806,54 @@ def attach_aim_handlers(trainer, val_evaluator, aim_logger, val_loader, rank):
             metric_names=["Mean Dice"],
             global_step_transform=global_step_from_engine(trainer),
         )
+        
+        aim_logger.attach(
+            val_evaluator,
+            log_handler=AimIgnite2DImageHandler(
+                "Prediction",
+                output_transform=from_engine([Keys.IMAGE, Keys.LABEL, Keys.PRED]),
+                global_step_transform=global_step_from_engine(trainer),
+            ),
+            # event_name=Events.ITERATION_COMPLETED(
+            #     every=2 if (len(val_loader) // 4) == 0 else len(val_loader) // 4
+            # ),
+            event_name=Events.ITERATION_COMPLETED
+        )
+        
     except Exception as e:
         logging.exception(f"[Rank {rank}] Failed during attach_aim_handlers: {e}")
+
+def start_aim_ui_server(config, rank=0):
+    """
+    Start the Aim UI server if it is not already running.
+    This function checks if the Aim UI server is running and starts it if not.
+    """
+    if rank != 0:
+        return
+    try:
+        # Check if Aim UI server is already running
+        aim_repo = config.train.logging.aim_repo
+        if not os.path.exists(aim_repo):
+            logging.info(f"Aim repository {aim_repo} does not exist. Creating it.")
+            os.makedirs(aim_repo, exist_ok=True)
+        
+        # Check if the port is already in use
+        port_check = os.system(f"lsof -i :43800")
+        if port_check == 0:
+            logging.info("Aim UI server is already running on port 43800.")
+            return
+        logging.info("Starting Aim UI server...")
+        # os.system(f"aim up --port 43800 --repo {config.train.logging.aim_repo} &")
+        aim_process = subprocess.Popen(
+            ["aim", "up", "--port", "43800", "--repo", config.train.logging.aim_repo],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        logging.info(f"Aim UI server started successfully with PID {aim_process.pid}.")
+        
+    except Exception as e:
+        logging.error(f"Failed to start Aim UI server: {e}")
+        logging.error(f"Please start the Aim UI server manually using 'aim up --port 43800 --repo {config.train.logging.aim_repo}'")
 
 # endregion
 
@@ -744,8 +864,6 @@ def main(rank, world_size):
     config = get_args()
 
     config.train.device = f"cuda:{rank}"
-
-    init_profiler(config)
 
     log_config(config, rank)
     torch.random.manual_seed(config.train.seed)
@@ -759,6 +877,10 @@ def main(rank, world_size):
     else:
         aim_logger = None
 
+    init_profiler(config, aim_logger.experiment, rank)
+    
+    start_aim_ui_server(config, rank)
+    
     train_loader, val_loader = get_dataloaders(config, aim_logger, rank, world_size)
 
     net, opt, diffusion, schduler = build_model(config, rank)
@@ -790,23 +912,24 @@ def main(rank, world_size):
         key_val_metric=metrics,
         ddim=config.model.ddim,
     )
-    logging.info(f"[Rank {rank}] Validation evaluator created")
+    # logging.info(f"[Rank {rank}] Validation evaluator created")
 
     attach_checkpoint_handler(trainer, net, opt, ema_params, config, rank)
 
     logging.info(f"[Rank {rank}] Checkpoint handler attached")
 
-    # attach_stats_handlers(trainer, val_evaluator, config, rank)
+    attach_stats_handlers(trainer, val_evaluator, config, rank)
 
     attach_ema_update(trainer, net, ema_params, config)
     logging.info(f"[Rank {rank}] EMA update handler attached")
 
-    # attach_ema_validation(trainer, net, ema_params, val_evaluator, val_loader, config)
+    attach_ema_validation(trainer, net, ema_params, val_evaluator, val_loader, config)
 
     # attach_validation(trainer, val_evaluator, config)
 
-    # attach_aim_handlers(trainer, val_evaluator, aim_logger, val_loader, rank)
+    attach_aim_handlers(trainer, val_evaluator, aim_logger, val_loader, rank)
 
+    logging.info(f"[Rank {rank}] Handlers attached")
     # val_evaluator.run()
 
     # Add barrier to ensure all processes are ready before starting training

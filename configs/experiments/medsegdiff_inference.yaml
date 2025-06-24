@@ -12,7 +12,7 @@ train:
   save_dir: "/home/yb107/cvpr2025/DukeDiffSeg/outputs"            # Where to save logs, checkpoints, config
   # Checkpointing
   save_interval: 50                        # Save checkpoint every N epochs
-  resume: null                               # Path to checkpoint to resume from
+  resume: "/home/yb107/cvpr2025/DukeDiffSeg/outputs/medsegdiff/checkpoints/MedSegDiff_checkpoint_1.pt"                                # Path to checkpoint to resume from
 
   # Optimizer
   optimizer:
@@ -27,7 +27,7 @@ train:
 
   logging:
     use_aim: true                            # Enable AIM logging
-    aim_repo: "/home/yb107/cvpr2025/DukeDiffSeg/aim/"                         # AIM repo directory
+    aim_repo: "aim/"                         # AIM repo directory
     log_interval: 10                         # Log every N iterations
 
 
@@ -50,8 +50,7 @@ data:
   orientation: "RAS"  # Image orientation (e.g., RAS, LPS)
   val_num_samples: 4                # Number of samples to validate on during validation
   num_workers: 4                        # Number of data loading workers
-  batch_size: 8                          # Batch size for training
-  val_batch_size: 1                     # Batch size for validation
+  batch_size: 1                          # Batch size for training
   slice_axis: -1                    # Axis along which to slice the 3D volume (0, 1, or 2)
   micro_batch_size: 1                  # Micro-batch size for gradient accumulation
  
@@ -62,7 +61,7 @@ model:
   image_size: 256  # Size of the input image (e.g., 64, 128, 256) # 64
   num_channels: 128  # Number of base channels in the model (model_channels) # Only 128 works fro some reason
   num_res_blocks: 1  # Number of residual blocks per resolution level
-  in_ch: 2  # Number of input channels (e.g., 1 for grayscale, 3 for RGB)
+  in_ch: 2  #  Number of input channels (e.g., 1 for grayscale, 3 for RGB)
   num_classes: null
   out_ch: 1 # Channels produced by the final 3×3 conv. For diffusion it’s often 2×#classes (predict μ & σ) or just in_channels.
   num_heads: 1  # Number of attention heads

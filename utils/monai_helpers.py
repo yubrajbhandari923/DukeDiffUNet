@@ -22,6 +22,8 @@ import multiprocessing
 import os
 import numpy as np
 
+import matplotlib.pyplot as plt
+
 
 class DiceScoreMetric(Metric):
     def __init__(self, device=None, smooth=1e-5):
@@ -63,7 +65,7 @@ class DiceScoreMetric(Metric):
         return dice
 
 
-class AimIgniteImageHandler:
+class AimIgnite3DImageHandler:
     """
     Ignite Image Handler for AIM.
 
@@ -99,7 +101,7 @@ class AimIgniteImageHandler:
         )
         tag_name = f"{self.tag} {' '.join(img_name.split('_')[:2])}"
 
-        if self.plot_once and tag_name in AimIgniteImageHandler.plotted_tags:
+        if self.plot_once and tag_name in AimIgnite3DImageHandler.plotted_tags:
             return
 
         if len(img.shape) == 5 or len(img.shape) == 4:
@@ -141,7 +143,7 @@ class AimIgniteImageHandler:
 
         if self.log_unique_values:
             unique_values = torch.unique(img).cpu()
-            if not AimIgniteImageHandler.last_printed_unique_values.equal(
+            if not AimIgnite3DImageHandler.last_printed_unique_values.equal(
                 unique_values
             ):
                 logger.experiment.log_info(
@@ -149,7 +151,148 @@ class AimIgniteImageHandler:
                     Unique values for {self.tag}: {unique_values}"""
                 )
 
-        AimIgniteImageHandler.plotted_tags.add(tag_name)
+        AimIgnite3DImageHandler.plotted_tags.add(tag_name)
+
+
+class AimIgnite2DImageHandler:
+    """
+    Ignite Image Handler for AIM.
+
+    """
+
+    plotted_tags = set()
+
+    def __init__(
+        self,
+        tag,
+        output_transform=None,
+        global_step_transform=None,
+        plot_once=False,
+    ):
+        self.tag = tag
+        self.output_transform = output_transform
+        self.global_step_transform = global_step_transform
+        self.plot_once = plot_once
+
+    def __call__(self, engine, logger, event_name):
+
+        if self.output_transform is not None:
+            data = self.output_transform(engine.state.output)
+            # ([Images], [Labels], [Predictions])
+
+        images = data[0]  # Assuming data is a tuple of (images, labels, predictions)
+        label = data[1]
+        pred = data[2]
+
+        for  img, lbl, prd in zip(images, label, pred):
+            img_name = (
+                img.meta["filename_or_obj"]
+                .split("/")[-1]
+                .split(".")[0]
+                .replace("_trans", "")
+            )
+            tag_name = f"{self.tag} {' '.join(img_name.split('_')[:2])}"
+
+            if self.plot_once and tag_name in AimIgnite2DImageHandler.plotted_tags:
+                return
+
+            # if len(img.shape) == 5 or len(img.shape) == 4:
+            img = img.squeeze()
+            lbl = lbl.squeeze()
+            prd = prd.squeeze()
+
+            if len(img.shape) > 2:
+                raise ValueError(
+                    f"Image shape {img.shape}, Label Shape {lbl.shape}, Pred Shape {prd.shape} is not 2D. Expected 2D images for visualizations."
+                )
+                
+            logging.info(f"Unique values in label: {torch.unique(lbl)}, Unique values in pred: {torch.unique(prd)}")
+            img_data = img.cpu().numpy()
+            label_data = lbl.cpu().numpy()
+            pred_data = prd.cpu().numpy()
+
+            # fig = plot_2d_images(img_name, img_data, label_data, pred_data)
+            fig = plot_image_label_pred(
+                img_name, img_data, label_data, pred_data
+            )
+            if self.global_step_transform is not None:
+                global_step = self.global_step_transform(engine, Events.EPOCH_COMPLETED)
+            else:
+                global_step = engine.state.get_event_attrib_value(event_name)
+            logger.experiment.track(Figure(fig), name=tag_name, step=global_step)
+            AimIgnite2DImageHandler.plotted_tags.add(tag_name)
+
+
+def normalize_uint8(x):
+    x = np.nan_to_num(x)  # clean NaNs
+    x = x - np.min(x)
+    x = x / (np.max(x) + 1e-8)
+    return (x * 255).astype(np.uint8)
+
+
+def plot_2d_images(img_name, img_data, label_data, pred_data):
+    """
+    2x2 grid layout with one empty cell.
+    """
+    fig = make_subplots(
+        rows=2,
+        cols=2,
+        subplot_titles=("Image", "Label", "Prediction", ""),
+        specs=[
+            [{"type": "image"}, {"type": "image"}],
+            [{"type": "image"}, None],  # Leave (2,2) empty
+        ],
+    )
+
+    # Normalize & add 3 grayscale images to 3 slots
+    fig.add_trace(go.Image(z=normalize_uint8(img_data)), row=1, col=1)
+    fig.add_trace(go.Image(z=normalize_uint8(label_data)), row=1, col=2)
+    fig.add_trace(go.Image(z=normalize_uint8(pred_data)), row=2, col=1)
+
+    fig.update_layout(
+        title=f"{img_name} 2D Images",
+        width=600,
+        height=600,
+        margin=dict(t=50, b=10),
+        font=dict(size=14),
+    )
+
+    return fig
+
+def plot_image_label_pred(title, image, label, pred):
+    """
+    Plot image, label, and prediction side by side.
+    """
+    image = image.squeeze()
+    label = label.squeeze()
+    pred = pred.squeeze()
+
+    # log shapes
+    logging.info(
+        f"Image shape: {image.shape}, Label shape: {label.shape}, Prediction shape: {pred.shape}"
+    )
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    axes[0].imshow(image.cpu().numpy(), cmap="gray")
+    axes[0].set_title("Image")
+    axes[1].imshow(label.cpu().numpy(), cmap="gray")
+    axes[1].set_title("Label")
+    axes[2].imshow(pred.cpu().numpy(), cmap="gray")
+    axes[2].set_title("Prediction")
+
+    # Add title to the figure if provided
+    # if title:
+    fig.suptitle(title, fontsize=16)
+    
+    fig.tight_layout()
+    
+    return fig
+    # # Save the plot to a file
+    # plot_path = f"image_label_pred_{title}.png" if title else "image_label_pred.png"
+    # plot_path = os.path.join(
+    #     "/home/yb107/cvpr2025/DukeDiffSeg/outputs/medsegdiff/images", plot_path
+    # )
+    # plt.savefig(plot_path)
 
 
 def get_slices_fig(img_data, img_name, n_every, volume=None, unique_values=None):

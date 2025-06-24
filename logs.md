@@ -15,4 +15,15 @@ Type log <Tab> to log stuff
 
 ## 🧪 Experiment Log – 2025-06-23 5:21 PM
 
-Done running the code 
+Medsegdiff ran for 200 epochs. need to fix eval code to make it run quickly.
+
+## 🧪 Experiment Log – 2025-06-24 11:12 AM
+
+Tried running inference on the trained code. Prediction was all zeros. Need to dig into the actual diffsion code base.
+
+Meeting Notes:
+Why this method? 
+- Porbably is better (especially in the hard cases like diseased liver/organs or tumors). Can prove this by running on the quality control failed cases of Dukeseg
+- Uncertainity based method
+- 
+
