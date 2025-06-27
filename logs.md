@@ -27,3 +27,13 @@ Why this method?
 - Uncertainity based method
 - 
 
+## 🧪 Experiment Log – 2025-06-27 1:50 PM
+
+So, Done with refining the codebase.
+At this point should be eaiser to bring in any dataloaders and models and quickly switch between the models.
+
+Questions right now:
+- On the aim logs, loss is > 1, why ? shouldn't it have been dice or something. Look in the Paper to understand this
+- Also, the results showed basically all zeros generating.
+- 
+

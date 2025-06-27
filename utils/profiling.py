@@ -5,6 +5,10 @@ import functools
 import aim
 from torch.profiler import profile, record_function, ProfilerActivity
 import torch
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logging.getLogger(__name__).setLevel(logging.INFO)
 
 _GLOBAL_PROF_CFG = None
 
@@ -41,11 +45,12 @@ def profile_block(name):
                 run = _GLOBAL_AIM_RUN.experiment
                 
                 if run:
-                    run.track(float(elapsed), name=name, context={"type": "timing"})
+                    # run.track(float(elapsed), name=name, context={"type": "timing"})
+                    run.log_info(f"{name} took {elapsed:.4f} seconds")
                 else:
-                    print(f"Warning: No active Aim run found. Profiling data for '{name}' not logged.")
+                    logging.info(f"Warning: No active Aim run found. {name} took {elapsed:.4f} seconds")
+                    
                 return result
-            
             else:
                 # If not rank 0, just call the function without profiling
                 return fn(*args, **kwargs)

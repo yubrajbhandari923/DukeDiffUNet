@@ -1,223 +1,251 @@
-name: "MedSegDiff"       # Experiment name for logging
-description: "Implemented MedSegDiff (Cloned) for PET Data"  # Description of the experiment
-version: 1.0                              # Configuration version
-tags: ["MedSegDiff", "diffusion", "segmentation", "3D", "medical imaging"]  # Tags for categorization
 
-train:
-  seed: 42                                 # Random seed for reproducibility
-  epochs: 2000                              # Total number of epochs
-  accumulate_grad_steps: 1                # Gradient accumulation
-  fp16: true                               # Mixed precision training
-  device: "cuda"                           # Training device
-  save_dir: "/home/yb107/cvpr2025/DukeDiffSeg/outputs"            # Where to save logs, checkpoints, config
-  # Checkpointing
-  save_interval: 50                        # Save checkpoint every N epochs
-  resume: null                               # Path to checkpoint to resume from
+# train:
+#   seed: 42                                 # Random seed for reproducibility
+#   epochs: 20000                              # Total number of epochs
+#   accumulate_grad_steps: 1                # Gradient accumulation
+#   fp16: true                               # Mixed precision training
+#   device: "cuda"                           # Training device
+#   save_dir: "/home/yb107/cvpr2025/DukeDiffSeg/outputs"            # Where to save logs, checkpoints, config
+#   # Checkpointing
+#   save_interval: 5                        # Save checkpoint every N epochs
+#   # resume: "/home/yb107/cvpr2025/DukeDiffSeg/outputs/medsegdiff/checkpoints/MedSegDiff_checkpoint_600.pt"                               # Path to checkpoint to resume from
+#   resume: null                              # Path to checkpoint to resume from (set to null to not resume)
+  
+#   # Optimizer
+#   optimizer:
+#     name: "AdamW"
+#     lr: 1e-4
+#     weight_decay: 0.01
 
-  # Optimizer
-  optimizer:
-    name: "AdamW"
-    lr: 1e-4
-    weight_decay: 0.01
+#   # Learning rate scheduler
+#   lr_scheduler:
+#     name: "CosineAnnealingLR"
+#     T_max: 50
 
-  # Learning rate scheduler
-  lr_scheduler:
-    name: "CosineAnnealingLR"
-    T_max: 50
-
-  logging:
-    use_aim: true                            # Enable AIM logging
-    aim_repo: "/home/yb107/cvpr2025/DukeDiffSeg/aim/"                         # AIM repo directory
-    log_interval: 10                         # Log every N iterations
+#   logging:
+#     use_aim: true                            # Enable AIM logging
+#     aim_repo: "/home/yb107/cvpr2025/DukeDiffSeg/aim/"                         # AIM repo directory
+#     log_interval: 10                         # Log every N iterations
 
 
-  eval:
-    validation_interval: 1                         # Validate every N epochs
-    visualize: true                     # Visualize predictions during validation
-    visualize_interval: 1                  # Visualize every N evaluation
-    save_predictions: true                  # Save predicted masks
-    save_predictions_interval: 1           # Save every N evaluations
-    metrics: ["dice", "hausdorff"]          # Evaluation metrics
-    early_stopping: true                  # Enable early stopping
-    patience: 20                           # Patience for early stopping
+#   eval:
+#     validation_interval: 1                         # Validate every N epochs
+#     visualize: true                     # Visualize predictions during validation
+#     visualize_interval: 1                  # Visualize every N evaluation
+#     visualize_num_samples: 50          # Number of samples to visualize during validation
+#     save_predictions: true                  # Save predicted masks
+#     save_predictions_interval: 1           # Save every N evaluations
+#     metrics: ["dice", "hausdorff"]          # Evaluation metrics
+#     early_stopping: true                  # Enable early stopping
+#     patience: 20                           # Patience for early stopping
 
-  amp_kwargs: 
-    fp16_scale_growth: 1e-3
+#   amp_kwargs: 
+#     fp16_scale_growth: 1e-3
 
-  optim_set_to_none: false
+#   optim_set_to_none: false
 
-data:
-  train_jsonl: "/home/yb107/cvpr2025/DukeDiffSeg/data/json/abdomen_1k_train.jsonl"  # JSONL file listing training image/label paths
-  val_jsonl: "/home/yb107/cvpr2025/DukeDiffSeg/data/json/abdomen_1k_val.jsonl"      # JSONL file listing validation image/label paths
-  roi_size: [256, 256]                # Shape of input volume patches
-  pixdim: [1.0, 1.0, 3.0]                     # Voxel dimensions in mm
-  orientation: "RAS"  # Image orientation (e.g., RAS, LPS)
-  val_num_samples: 4                # Number of samples to validate on during validation
-  num_workers: 4                        # Number of data loading workers
-  batch_size: 8                          # Batch size for training
-  val_batch_size: 1                     # Batch size for validation
-  slice_axis: -1                    # Axis along which to slice the 3D volume (0, 1, or 2)
-  micro_batch_size: 1                  # Micro-batch size for gradient accumulation
- 
-model:
-  name: "MedSegDiff"                        # Main model class name
-
-  # Denoising UNet  
-  image_size: 256  # Size of the input image (e.g., 64, 128, 256) # 64
-  num_channels: 128  # Number of base channels in the model (model_channels) # Only 128 works fro some reason
-  num_res_blocks: 1  # Number of residual blocks per resolution level
-  in_ch: 2  # Number of input channels (e.g., 1 for grayscale, 3 for RGB)
-  num_classes: null
-  out_ch: 1 # Channels produced by the final 3×3 conv. For diffusion it’s often 2×#classes (predict μ & σ) or just in_channels.
-  num_heads: 1  # Number of attention heads
-  num_heads_upsample: -1  # Number of attention heads during upsampling (-1 to reuse num_heads)
-  num_head_channels: -1  # Number of channels per attention head (-1 to use num_channels // num_heads)
-  attention_resolutions: "8"  # Resolutions at which attention is applied (comma-separated)
-  channel_mult: "" # Default
-  # channel_mult: "1,2,2"  # Channel multiplier for each resolution level (list of integers)
-  dropout: 0.0  # Dropout rate
-  class_cond: false  # Enable class conditioning
-  use_checkpoint: false  # Enable gradient checkpointing for memory efficiency
-  use_scale_shift_norm: true  # Use scale-shift normalization
-  resblock_updown: false  # Use residual blocks for upsampling/downsampling
-  use_fp16: false  # Use mixed precision training
-  use_new_attention_order: false  # Use new attention order (if applicable)
-  dpm_solver: true  # Use DPM-Solver for evaulation improved sampling (if applicable)
-  version: "new"  # Version of the model architecture
-
-  diffusion_steps: 1000  # Number of diffusion steps
-  noise_schedule: "linear"  # Noise schedule type (linear, cosine, etc.)
-  timestep_respacing: ""  # Custom timestep spacing (empty means default)
-  use_kl: false  # Use KL loss instead of MSE
-
-  predict_xstart: false  # Predict initial image instead of noise
-  rescale_timesteps: true  # Rescale time steps to [0, 1]
-  rescale_learned_sigmas: true  # Rescale learned sigmas
-  ddim: false
-  # Super-resolution specific
-  large_size: 64  # Target large image size
-  small_size: 32  # Input small image size
-
-  schedule_sampler: "uniform"
-  clip_denoised: false
-  ema_rate: 0.9999
-  lr_anneal_steps: 0
-
-  n_rounds: 1  # Number of rounds for training
-
-
-
-# # ───────────────────────────────────────────────────────────
-# # Basic experiment metadata
-# experiment:
-#   name:    "MedSegDiff"
-#   version: 1.0
-#   description: "Implemented MedSegDiff (Cloned) for PET Data"
-#   tags: ["MedSegDiff", "diffusion", "segmentation", "3D", "medical imaging"]
-
-# # ───────────────────────────────────────────────────────────
-# # Global seed for reproducibility
-# seed: 42
-
-# # ───────────────────────────────────────────────────────────
-# # Logging & monitoring
-# logging:
-#   use_aim:       true
-#   aim_repo:      "/home/yb107/cvpr2025/DukeDiffSeg/aim/"
-#   log_interval:  10       # iterations
-#   aim_ui_port:   43800
-
-# # ───────────────────────────────────────────────────────────
-# # Data & DataLoader settings
 # data:
-#   train_jsonl:        "/home/yb107/.../abdomen_1k_train.jsonl"
-#   val_jsonl:          "/home/yb107/.../abdomen_1k_val.jsonl"
-#   orientation:        "RAS"
-#   pixdim:             [1.0, 1.0, 3.0]
-#   roi_size:           [256, 256]
-#   slice_axis:         -1
-#   micro_batch_size:   1      # for gradient accumulation
-#   batch_size:         8
-#   val_batch_size:     1
-#   num_workers:        4
-#   val_num_samples:    4
-
-# # ───────────────────────────────────────────────────────────
-# # Training hyperparameters
-# training:
-#   device:              "cuda"
-#   epochs:              2000
-#   accumulate_grad_steps: 1
-#   fp16:                true
-#   optim_set_to_none:   false
-#   save_dir:            "/home/yb107/.../outputs"
-#   save_interval:       50      # epochs
-#   resume:              null
-
-# # ───────────────────────────────────────────────────────────
-# # Optimizer & scheduler
-# optimizer:
-#   name:       "AdamW"
-#   lr:         1e-4
-#   weight_decay: 0.01
-
-# lr_scheduler:
-#   name:       "CosineAnnealingLR"
-#   T_max:      50
-
-# # ───────────────────────────────────────────────────────────
-# # Evaluation & early stopping
-# evaluation:
-#   validation_interval:     1        # epochs
-#   metrics:               ["dice", "hausdorff"]
-#   early_stopping:
-#     enable: true
-#     patience: 20
-#   visualize:             true
-#   visualize_interval:    1
-#   save_predictions:      true
-#   save_pred_interval:    1
-
-# # ───────────────────────────────────────────────────────────
-# # Model architecture (easy to swap out a different 'model.params' block)
+#   train_jsonl: "/home/yb107/cvpr2025/DukeDiffSeg/data/json/abdomen_1k_train_updated.jsonl"  # JSONL file listing training image/label paths
+#   val_jsonl: "/home/yb107/cvpr2025/DukeDiffSeg/data/json/abdomen_1k_val_updated.jsonl"      # JSONL file listing validation image/label paths
+#   roi_size: [256, 256]                # Shape of input volume patches
+#   pixdim: [1.0, 1.0, 3.0]                     # Voxel dimensions in mm
+#   orientation: "RAS"  # Image orientation (e.g., RAS, LPS)
+#   val_num_samples: 4                # Number of samples to validate on during validation
+#   num_workers: 8                        # Number of data loading workers
+#   batch_size: 32                          # Batch size for training
+#   val_batch_size: 1                     # Batch size for validation
+#   slice_axis: -1                    # Axis along which to slice the 3D volume (0, 1, or 2)
+#   micro_batch_size: 1                  # Micro-batch size for gradient accumulation
+#   cache_dir: "/NAS/user_data/user/yb107/cache_dir"
+ 
 # model:
-#   name:       "MedSegDiff"       # used to select your Python class
-#   params:
-#     # UNet backbone
-#     image_size:        256
-#     in_ch:             2
-#     num_channels:      128
-#     num_res_blocks:    1
-#     out_ch:            1
-#     class_cond:        false
-#     use_checkpoint:    false
-#     use_scale_shift_norm: true
-#     resblock_updown:   false
-#     num_heads:         1
-#     num_head_channels: -1
-#     attention_resolutions: "8"
-#     dropout:           0.0
+#   name: "MedSegDiff"                        # Main model class name
 
-# # ───────────────────────────────────────────────────────────
-# # Diffusion-specific hyperparameters
-# diffusion:
-#   steps:             1000
-#   noise_schedule:    "linear"
-#   timestep_respacing: ""
-#   use_kl:            false
-#   predict_xstart:    false
-#   rescale_timesteps: true
-#   rescale_learned_sigmas: true
-#   clip_denoised:     false
-#   ddpm_solver:       false
-#   ddim:              false
-#   dpm_solver:        true
-#   schedule_sampler:  "uniform"
-#   ema_rate:          0.9999
-#   lr_anneal_steps:   0
+#   # Denoising UNet  
+#   image_size: 256  # Size of the input image (e.g., 64, 128, 256) # 64
+#   num_channels: 128  # Number of base channels in the model (model_channels) # Only 128 works fro some reason
+#   num_res_blocks: 1  # Number of residual blocks per resolution level
+#   in_ch: 2  # Number of input channels (e.g., 1 for grayscale, 3 for RGB)
+#   num_classes: null
+#   out_ch: 1 # Channels produced by the final 3×3 conv. For diffusion it’s often 2×#classes (predict μ & σ) or just in_channels.
+#   num_heads: 1  # Number of attention heads
+#   num_heads_upsample: -1  # Number of attention heads during upsampling (-1 to reuse num_heads)
+#   num_head_channels: -1  # Number of channels per attention head (-1 to use num_channels // num_heads)
+#   attention_resolutions: "8"  # Resolutions at which attention is applied (comma-separated)
+#   channel_mult: "" # Default
+#   # channel_mult: "1,2,2"  # Channel multiplier for each resolution level (list of integers)
+#   dropout: 0.0  # Dropout rate
+#   class_cond: false  # Enable class conditioning
+#   use_checkpoint: false  # Enable gradient checkpointing for memory efficiency
+#   use_scale_shift_norm: true  # Use scale-shift normalization
+#   resblock_updown: false  # Use residual blocks for upsampling/downsampling
+#   use_fp16: false  # Use mixed precision training
+#   use_new_attention_order: false  # Use new attention order (if applicable)
+#   dpm_solver: true  # Use DPM-Solver for evaulation improved sampling (if applicable)
+#   version: "new"  # Version of the model architecture
 
-# # ───────────────────────────────────────────────────────────
-# # Mixed-precision & AMP settings
-# amp:
-#   enabled:           true
-#   fp16_scale_growth: 1e-3
+#   diffusion_steps: 1000  # Number of diffusion steps
+#   noise_schedule: "linear"  # Noise schedule type (linear, cosine, etc.)
+#   timestep_respacing: ""  # Custom timestep spacing (empty means default)
+#   use_kl: false  # Use KL loss instead of MSE
+
+#   predict_xstart: false  # Predict initial image instead of noise
+#   rescale_timesteps: true  # Rescale time steps to [0, 1]
+#   rescale_learned_sigmas: true  # Rescale learned sigmas
+#   ddim: false
+
+#   # Super-resolution specific
+#   large_size: 64  # Target large image size
+#   small_size: 32  # Input small image size
+
+#   schedule_sampler: "uniform"
+#   clip_denoised: false
+#   ema_rate: 0.9999
+#   lr_anneal_steps: 0
+
+#   n_rounds: 1  # Number of rounds for training
+
+# TODO:
+#  - Add grad accumulation support and micro-batch support if necessary
+
+
+# ───────────────────────────────────────────────────────────
+# Basic experiment metadata
+experiment:
+  name: "MedSegDiff"
+  version: 1.0
+  description: "Trying to run Medsegdiff into my own environment and dataset"
+  tags: ["MedSegDiff", "diffusion", "segmentation", "3D", "medical imaging"]
+
+# ───────────────────────────────────────────────────────────
+# Global seed for reproducibility
+seed: 42
+
+# ───────────────────────────────────────────────────────────
+# Logging & monitoring
+logging:
+  use_aim:       true
+  aim_repo:      "/home/yb107/cvpr2025/DukeDiffSeg/aim/"
+  log_interval:  10       # iterations
+  aim_ui_port:   43800
+
+# ───────────────────────────────────────────────────────────
+# Data & DataLoader settings
+data:
+  description: "Abdomen 1K dataset for segmentation"
+  # cache_dir:          "/NAS/user_data/user/yb107/cache_dir"
+  cache_dir:          "/data/usr/yb107/cache"
+  orientation:        "RAS"
+  pixdim:             [1.0, 1.0, 3.0]
+  roi_size:           [256, 256]
+  slice_axis:         -1
+  
+  train_jsonl:        "/home/yb107/cvpr2025/DukeDiffSeg/data/json/abdomen_1k_train_updated.jsonl"
+  batch_size:         8
+  num_workers:        4
+  micro_batch_size:   1      # for gradient accumulation
+
+  val_jsonl:          "/home/yb107/cvpr2025/DukeDiffSeg/data/json/abdomen_1k_train_updated.jsonl"
+  val_batch_size:     1
+  val_num_workers:      4
+  val_num_samples:    4
+
+# ───────────────────────────────────────────────────────────
+# Training hyperparameters
+training:
+  device:              "cuda"
+  epochs:              2000
+  accumulate_grad_steps: 1
+  fp16:                true
+  optim_set_to_none:   false
+  save_dir:            "/home/yb107/cvpr2025/DukeDiffSeg/outputs"
+  save_interval:       10      # epochs
+  resume:              null # Path to checkpoint to resume from (set to null to not resume)
+
+# ───────────────────────────────────────────────────────────
+# Optimizer & scheduler
+optimizer:
+  name:       "AdamW"
+  lr:         1e-4
+  weight_decay: 0.01
+  set_to_none: false  # Set optimizer parameters to None for memory efficiency
+
+lr_scheduler:
+  name:       "CosineAnnealingLR"
+  T_max:      50
+
+# ───────────────────────────────────────────────────────────
+# Evaluation & early stopping
+evaluation:
+  validation_interval:     1        # epochs
+  metrics:               ["dice", "hausdorff"]
+  early_stopping:
+    enable: true
+    patience: 20
+  visualize:             true
+  visualize_num_samples: 50
+  visualize_interval:    1
+  save_predictions:      true
+  save_pred_interval:    1
+
+# ───────────────────────────────────────────────────────────
+# Model architecture (easy to swap out a different 'model.params' block)
+model:
+  name:       "MedSegDiff"       # used to select your Python class
+  params:
+    # UNet backbone
+    image_size:        64
+    num_channels:      128
+    num_res_blocks:    2
+    channel_mult:      ""  # Default channel multiplier
+    learn_sigma:      false 
+    class_cond:        false
+    attention_resolutions: "16,8"
+    in_ch:             2
+    out_ch:            1
+    num_heads:         4
+    num_head_channels: -1
+    num_heads_upsample: -1
+    dropout:           0.0
+    resblock_updown:   false
+    use_fp16:          false
+    use_new_attention_order: false
+    version:          "new"
+
+    use_checkpoint:    false  # Enable gradient checkpointing for memory efficiency
+    use_scale_shift_norm: true  # Use scale-shift normalization
+
+    ema_rate:          0.9999
+
+
+    # Inference-specific parameters
+    n_rounds: 1  
+
+# ───────────────────────────────────────────────────────────
+# Diffusion-specific hyperparameters
+diffusion:
+  diffusion_steps:             1000
+  learn_sigma:       false
+  noise_schedule:    "linear"
+  use_kl:            false
+  predict_xstart:    false
+  rescale_timesteps: false
+  rescale_learned_sigmas: false
+  dpm_solver:        true # Use DPM-Solver for improved sampling
+  timestep_respacing: ""
+
+  schedule_sampler:
+    name: "uniform"
+    max_steps: 1000
+ 
+  clip_denoised:     false
+  lr_anneal_steps:   0
+
+  ddpm_solver:       false
+  ddim:              false
+
+# ───────────────────────────────────────────────────────────
+# Mixed-precision & AMP settings
+amp:
+  enabled:           true
+  fp16_scale_growth: 1e-3
