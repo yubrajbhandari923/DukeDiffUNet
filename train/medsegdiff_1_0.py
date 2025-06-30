@@ -16,6 +16,7 @@ from omegaconf import OmegaConf
 
 import torch
 import torch.optim as optim
+from torch.amp import GradScaler, autocast
 from ignite.engine import Events, Engine, EventEnum
 from ignite.handlers import EarlyStopping, ModelCheckpoint, global_step_from_engine
 import ignite.distributed as idist
@@ -55,10 +56,9 @@ from monai.handlers import (
 from monai.data import list_data_collate, NumpyReader
 from monai.engines import Evaluator, Trainer
 from monai.utils.enums import CommonKeys as Keys
-
+from monai.data.utils import pickle_hashing
 
 from model.medsegdiffv2.guided_diffusion.resample import LossAwareSampler, UniformSampler
-from model.medsegdiffv2.guided_diffusion.fp16_util import MixedPrecisionTrainer
 from model.medsegdiffv2.guided_diffusion.utils import staple
 from model.medsegdiffv2 import MedSegDiffModel
 # from model.medsegdiffv2.guided_diffusion.custom_dataset_loader import CustomDataset3D
@@ -136,27 +136,37 @@ def train_step(engine, batchdata):
         batchdata, engine.state.device, engine.non_blocking
     )
     engine.network.train()
-    engine.mp_trainer.zero_grad()
+
+    optimizer = engine.optimizer
+    scaler = engine.scaler
+    use_amp = engine.use_amp
 
     # 2) sample timesteps & weights
     t, weights = engine.schedule_sampler.sample(labels.shape[0], engine.state.device)
 
+    optimizer.zero_grad(set_to_none=engine.optim_set_to_none)
+    
     # 3) compute the diffusion loss
     combined = torch.cat((labels, images), dim=1)
-    with engine.network.no_sync():
+    
+    with autocast(enabled=use_amp):
         loss_dict, sample = engine.diffusion.training_losses_segmentation(
             engine.network, None, combined, t, model_kwargs={}
         )
+    
     if isinstance(engine.schedule_sampler, LossAwareSampler):
         engine.schedule_sampler.update_with_local_losses(t, loss_dict["loss"].detach())
-
-    # weighted combination
     loss = (loss_dict["loss"] * weights + loss_dict["loss_cal"] * 10).mean()
 
     # 4) backward + step
-    engine.optimizer.zero_grad(set_to_none=engine.optim_set_to_none)
-    engine.mp_trainer.backward(loss)
-    engine.mp_trainer.optimize(engine.optimizer)
+    if use_amp:
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+    
+    else:
+        loss.backward()
+        optimizer.step()
 
     # 5) return whatever you need in metrics/handlers
     #    here we return a dict so StatsHandler can pick out "loss"
@@ -406,6 +416,16 @@ class GetSliced(monai.transforms.MapTransform):
 def threshold_label(x: torch.Tensor) -> torch.Tensor:
     return (x > 0).int()
 
+def volume_hash(item):
+    # keep only the fields you care about
+    filtered = {
+        Keys.IMAGE: item[Keys.IMAGE],
+        Keys.LABEL: item[Keys.LABEL],
+    }
+    # use MONAI's pickle_hashing on the filtered dict
+    return pickle_hashing(filtered)
+
+
 @profile_block("get_dataloaders")
 def get_dataloaders(config, aim_logger, rank):
     train_files = []
@@ -447,7 +467,7 @@ def get_dataloaders(config, aim_logger, rank):
             for d in val_files
             for i in range(d["shape"][axis])
             ]
-        
+
         train_files = json.dumps(train_slices)
         val_files = json.dumps(val_slices)
 
@@ -457,24 +477,23 @@ def get_dataloaders(config, aim_logger, rank):
 
     train_files = idist.utils.broadcast(train_files, src=0, safe_mode=True)
     val_files = idist.utils.broadcast(val_files, src=0, safe_mode=True)
-    
+
     # Convert JSON strings back to lists of dictionaries
     train_files = json.loads(train_files) if isinstance(train_files, str) else train_files
     val_files = json.loads(val_files) if isinstance(val_files, str) else val_files
-    
+
     if config.evaluation.visualize:
         rem = len(val_files) % config.evaluation.visualize_num_samples
-        
+
         if rank == 0:
             logging.info(f"To visualize, we need to have a multiple of {config.evaluation.visualize_num_samples} samples. Current length: {len(val_files)}")
-        
+
         if rem > 0:
             val_files = val_files[:-rem]
-        
+
         if rank == 0:
             logging.info(f"Validation files length after adjustment: {len(val_files)}")
-        
-    
+
     # train_files = train_files
     if aim_logger is not None and rank == 0:
         aim_logger.experiment.log_info(
@@ -485,6 +504,8 @@ def get_dataloaders(config, aim_logger, rank):
             f"Validation files {json.dumps(val_files, indent=2)}"
         )
         logging.info(f"Validation files length: {len(val_files)}")
+    
+
 
     train_transforms = Compose(
         [
@@ -536,6 +557,7 @@ def get_dataloaders(config, aim_logger, rank):
                 keys=[Keys.IMAGE, Keys.LABEL],
                 axcodes=config.data.orientation,
             ),
+            Lambdad(keys=[Keys.LABEL], func=threshold_label),
             # GetRandomSlice(axis=config.data.slice_axis),  # Custom transform to get a random slice
             GetSliced(
                 keys=[Keys.IMAGE, Keys.LABEL],
@@ -546,12 +568,14 @@ def get_dataloaders(config, aim_logger, rank):
                 keys=[Keys.IMAGE, Keys.LABEL],
                 spatial_size=config.data.roi_size,
             ),
-            Lambdad(keys=[Keys.LABEL], func=threshold_label),
         ]
     )
+    
 
     # create a training data loader
-    train_ds = monai.data.PersistentDataset(data=train_files, transform=train_transforms, cache_dir=config.data.cache_dir)
+    train_ds = monai.data.CacheNTransDataset(
+        data=train_files, transform=train_transforms, cache_n_trans=5, cache_dir=config.data.cache_dir, hash_func=volume_hash,
+    )
     train_loader = auto_dataloader(
         train_ds,
         batch_size=config.data.batch_size,
@@ -561,7 +585,13 @@ def get_dataloaders(config, aim_logger, rank):
         persistent_workers=True,
     )
     # create a validation data loader
-    val_ds = monai.data.PersistentDataset(data=val_files, transform=val_transforms, cache_dir=config.data.cache_dir)
+    val_ds = monai.data.CacheNTransDataset(
+        data=val_files,
+        transform=val_transforms,
+        cache_dir=config.data.cache_dir,
+        cache_n_trans=5,
+        hash_func=volume_hash,
+    )
     val_loader = auto_dataloader(
         val_ds,
         batch_size=config.data.val_batch_size,
@@ -841,11 +871,9 @@ def _distributed_run(rank, config):
     trainer.optimizer         = opt
     trainer.diffusion         = diffusion
     trainer.schedule_sampler  = schduler
-    trainer.mp_trainer        = MixedPrecisionTrainer(
-                                model=net,
-                                use_fp16=False,
-                                fp16_scale_growth=config.amp.fp16_scale_growth,
-                                )
+    trainer.scaler             = GradScaler(enabled=config.amp.enabled)
+    trainer.use_amp            = config.amp.enabled
+    
     trainer.optim_set_to_none = config.optimizer.set_to_none
 
     # post_pred = AsDiscreted(keys=Keys.PRED, argmax=True, to_onehot=2)
