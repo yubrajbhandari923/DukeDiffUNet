@@ -160,6 +160,7 @@ def create_model(
     use_new_attention_order=False,
     version = 'new',
     num_classes=None,
+    dims=2,  # Yubraj Added
 ):
     if channel_mult == "":
         if image_size == 512:
@@ -199,6 +200,7 @@ def create_model(
         use_scale_shift_norm=use_scale_shift_norm,
         resblock_updown=resblock_updown,
         use_new_attention_order=use_new_attention_order,
+        dims=dims
     ) if version == 'new' else UNetModel_v1preview(
         image_size=image_size,
         in_channels=in_ch,

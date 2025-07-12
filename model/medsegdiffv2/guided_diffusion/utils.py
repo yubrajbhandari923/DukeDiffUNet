@@ -89,6 +89,6 @@ def export(tar, img_path=None):
         s = th.cat((s,s,s),1)
         vutils.save_image(s, fp = img_path)
 
-def norm(t):
+def norm(t, eps=1e-5):
     m, s, v = torch.mean(t), torch.std(t), torch.var(t)
-    return (t - m) / s
+    return (t - m) / (s + eps)

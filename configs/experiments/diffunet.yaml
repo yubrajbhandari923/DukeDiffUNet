@@ -1,11 +1,15 @@
 
+# TODO:
+#  - Add grad accumulation support and micro-batch support if necessary
+
+
 # ───────────────────────────────────────────────────────────
 # Basic experiment metadata
 experiment:
-  name: "MedSegDiff"
+  name: "DiffUNet"
   version: 1.0
-  description: "Trying to run Medsegdiff into my own environment and dataset"
-  tags: ["MedSegDiff", "Inference", "3D", "medical imaging"]
+  description: "Reproducing DiffUNet with Multi-Class Setup"
+  tags: ["DiffUNet", "3D"]
 
 # ───────────────────────────────────────────────────────────
 # Global seed for reproducibility
@@ -22,17 +26,18 @@ logging:
 # ───────────────────────────────────────────────────────────
 # Data & DataLoader settings
 data:
-  description: "Abdomen 1K dataset for segmentation"
+  description:        "Abdomen 1K dataset for segmentation"
+  num_classes:        5 # background + 4 organs
   # cache_dir:          "/NAS/user_data/user/yb107/cache_dir"
-  cache_dir:          "/data/usr/yb107/cache"
+  cache_dir:          "/data/usr/yb107/cache_3d"
   orientation:        "RAS"
-  pixdim:             [1.0, 1.0, 3.0]
-  roi_size:           [256, 256]
+  pixdim:             [1.5, 1.5, 2.0]
+  roi_size:           [96, 96, 96]
   slice_axis:         -1
   
   train_jsonl:        "/home/yb107/cvpr2025/DukeDiffSeg/data/json/abdomen_1k_train_updated.jsonl"
-  batch_size:         16
-  num_workers:        16
+  batch_size:         4
+  num_workers:        8
   micro_batch_size:   1      # for gradient accumulation # Not implemented yet
 
   val_jsonl:          "/home/yb107/cvpr2025/DukeDiffSeg/data/json/abdomen_1k_val_updated.jsonl"
@@ -43,94 +48,74 @@ data:
 # Training hyperparameters
 training:
   device:              "cuda"
-  epochs:              2000
+  epochs:              5000
   accumulate_grad_steps: 1
-  fp16:                true
   save_dir:            "/home/yb107/cvpr2025/DukeDiffSeg/outputs"
-  save_interval:       3      # epochs
-  # resume:              "/home/yb107/cvpr2025/MedSegDiff/results/emasavedmodel_0.9999_010000.pt" # Path to checkpoint to resume from (set to null to not resume)
-  resume: "/home/yb107/cvpr2025/DukeDiffSeg/outputs/medsegdiff/checkpoints/MedSegDiff_checkpoint_93.pt"
+  save_interval:       5      # epochs
+  resume:              null # Path to checkpoint to resume from (set to null to not resume)
+  
 # ───────────────────────────────────────────────────────────
 # Optimizer & scheduler
 optimizer:
   name:       "AdamW"
-  lr:         1e-4
-  weight_decay: 0
-  set_to_none: false  # Set optimizer parameters to None for memory efficiency
+  lr:         2e-4
+  weight_decay: 1e-3
+  set_to_none: true  # Set optimizer parameters to None for memory efficiency
+
+ema:
+  enable: true
+  ema_rate: 0.9999
+  update_after_step: 1000
+  update_every_step: true
 
 lr_scheduler:
-  name:       "CosineAnnealingLR"
-  T_max:      50
+  # pick either LinearWarmupCosineAnnealingLR or any torch scheduler
+  name:               "LinearWarmupCosineAnnealingLR"
+  # only used by the warmup+cosine scheduler:
+  warmup_epochs:      100
+  max_epochs:         ${training.epochs}
 
 # ───────────────────────────────────────────────────────────
 # Evaluation & early stopping
 evaluation:
-  validation_interval:     2        # epochs
-  validation_max_num_samples: 1000 
+  validation_interval:     10        # epochs
+  validation_max_num_samples: 100 
   metrics:               ["dice", "hausdorff"]
   early_stopping:
     enable: true
     patience: 20
   visualize:             true
-  visualize_num_samples: 200
-  visualize_interval:    1
+  visualize_every_iter:  10 
   save_predictions:      true
   save_pred_interval:    1
 
 # ───────────────────────────────────────────────────────────
 # Model architecture (easy to swap out a different 'model.params' block)
 model:
-  name:       "MedSegDiff"       # used to select your Python class
-  params:
-    # UNet backbone
-    image_size:        256  # Size of the input image (e.g., 64, 128, 256)
-    num_channels:      128
-    num_res_blocks:    2
-    channel_mult:      ""  # Default channel multiplier
-    learn_sigma:      false 
-    class_cond:        false
-    attention_resolutions: "16,8"
-    in_ch:            2 # 1 for image, 1 for mask
-    out_ch:            1 
-    num_heads:         4
-    num_head_channels: -1
-    num_heads_upsample: -1
-    dropout:           0.0
-    resblock_updown:   false
-    use_fp16:          false
-    use_new_attention_order: false
-    version:          "new"
+  name: "DiffUNet"
+  params: 
+    spatial_dims: 3
+    in_channels: 1
+    out_channels: "${data.num_classes}"  # Number of classes for segmentation
+    features: [32, 64, 128, 256, 512, 64]
+    activation: ["LeakyReLU", {"negative_slope": 0.1, "inplace": False}]
+    beta_schedule: "linear"
 
-    use_checkpoint:    false  # Enable gradient checkpointing for memory efficiency
-    use_scale_shift_norm: true  # Use scale-shift normalization
-
-    ema_rate:          0.99
-
-
-    # Inference-specific parameters
-    n_rounds: 1  
+    dropout: 0.0
+    use_checkpointing: true
 
 # ───────────────────────────────────────────────────────────
 # Diffusion-specific hyperparameters
 diffusion:
   diffusion_steps:   1000
-  learn_sigma:       false
-  noise_schedule:    "linear"
-  use_kl:            false
-  predict_xstart:    false
-  rescale_timesteps: false
-  rescale_learned_sigmas: false
-  dpm_solver:        false # Use DPM-Solver for improved sampling
-  timestep_respacing: ""
+  ddim_steps:      10
+  beta_schedule:    "linear" # Options: "linear", "cosine", 
 
   schedule_sampler:
     name: "uniform"
     max_steps: 1000
  
-  clip_denoised:     false
-  lr_anneal_steps:   0
-
-  ddpm_solver:       false
+  clip_denoised:     true
   ddim:              false
 
 # ───────────────────────────────────────────────────────────
@@ -138,3 +123,5 @@ diffusion:
 amp:
   enabled:           false
   fp16_scale_growth: 1e-3
+
+

@@ -1,12 +1,21 @@
 #!/bin/bash
 cd /home/yb107/cvpr2025/DukeDiffSeg
 
-# python -m train.segdiff_1_0 --exp_config /home/yb107/cvpr2025/DukeDiffSeg/configs/experiments/segdiff.yaml
-pipenv run bash -c "CUDA_VISIBLE_DEVICES=7 nohup torchrun --master-port=29712 --nproc_per_node=1 -m train.medsegdiff_1_0 \
-  --exp_config /home/yb107/cvpr2025/DukeDiffSeg/configs/experiments/medsegdiff_inference.yaml > /home/yb107/logs/val_medsegdiff.log 2>&1 &"
+LOGFILE="/home/yb107/logs/val_medsegdiff.log"
+PIDFILE="/home/yb107/logs/val_medsegdiff.pid"
 
-echo "Started torchrun (PID $$) — logs: /home/yb107/logs/val_medsegdiff.log"
-echo "To stop the process, use: kill $$"
-echo "To view logs, use: tail -f /home/yb107/logs/val_medsegdiff.log"
-echo "To view the process list, use: ps aux | grep torchrun"
-echo "To check GPU usage, use: nvidia-smi"
+# Clean up any old PID file
+if [ -f "$PIDFILE" ]; then
+    rm "$PIDFILE"
+fi
+
+# Launch in new process group with setsid
+pipenv run bash -c "CUDA_VISIBLE_DEVICES=7 OMP_NUM_THREADS=8 setsid nohup python -m inference.medsegdiff_1_0 \
+  --exp_config /home/yb107/cvpr2025/DukeDiffSeg/configs/experiments/medsegdiff_inference.yaml > $LOGFILE 2>&1 & echo \$! > $PIDFILE"
+
+echo "🚀 Training started — logs: $LOGFILE"
+echo "📄 Main PID saved to: $PIDFILE"
+echo "🔍 View logs: tail -f $LOGFILE"
+echo "🛑 Kill training and all subprocesses: /home/yb107/cvpr2025/DukeDiffSeg/scripts/kill_training.sh"
+echo "🎮 Check GPU usage: nvidia-smi"
+

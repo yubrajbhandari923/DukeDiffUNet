@@ -433,18 +433,18 @@ def volume_hash(item):
 def get_dataloaders(config, aim_logger, rank):
     train_files = []
     val_files = []
+
+    with open(config.data.train_jsonl, "r") as f:
+        for line in f:
+            data = json.loads(line)
+            train_files.append({Keys.IMAGE: data["image"], Keys.LABEL: data["mask"]})
+
+    with open(config.data.val_jsonl, "r") as f:
+        for line in f:
+            data = json.loads(line)
+            val_files.append({Keys.IMAGE: data["image"], Keys.LABEL: data["mask"]})
+
     if rank == 0:
-        # load the training and validation data
-        with open(config.data.train_jsonl, "r") as f:
-            for line in f:
-                data = json.loads(line)
-                train_files.append({Keys.IMAGE: data["image"], Keys.LABEL: data["mask"], "shape": data["shape"]})
-    
-        with open(config.data.val_jsonl, "r") as f:
-            for line in f:
-                data = json.loads(line)
-                val_files.append({Keys.IMAGE: data["image"], Keys.LABEL: data["mask"], "shape": data["shape"]})
-    
         aim_logger.experiment.log_info(
             f"Training files {json.dumps(train_files, indent=2)}"
         )
@@ -453,56 +453,22 @@ def get_dataloaders(config, aim_logger, rank):
             f"Validation files {json.dumps(val_files, indent=2)}"
         )
         logging.info(f"Validation files length: {len(val_files)}")
-        axis = config.data.slice_axis
-        
-        if axis not in [1, 2, 3, -1, -2, -3]:
-            raise ValueError("Slice axis must be 1 (depth), 2 (height), or 3 (width) for 4D tensors or -1, -2, -3 for negative indexing.")
+       
+    if DEBUG:
+        train_files = train_files[:10]
+        val_files = val_files[:10]
 
-        train_slices = [
-            {
-                Keys.IMAGE: d[Keys.IMAGE],
-                Keys.LABEL: d[Keys.LABEL],
-                "slice_idx": i,
-            }
-            for d in train_files
-            for i in range(d["shape"][axis])
-            ]
-        
-        val_slices = [
-            {
-                Keys.IMAGE: d[Keys.IMAGE],
-                Keys.LABEL: d[Keys.LABEL],
-                "slice_idx": i,
-            }
-            for d in val_files
-            for i in range(d["shape"][axis])
-            ]
-        
-        if DEBUG:
-            train_slices = train_slices[:64]
-            val_slices = val_slices[:32]
+    if len(val_files) > config.evaluation.validation_max_num_samples:
+        # Randomly sample validation slices to limit the number of samples
+        logging.info(f"Validation files length before sampling: {len(val_files)}")
+        np.random.seed(config.seed)
+        np.random.shuffle(val_files)
+        val_files = val_files[:config.evaluation.validation_max_num_samples]
+        logging.info(f"Validation files length after sampling: {len(val_files)}")
 
-        if len(val_slices) > config.evaluation.validation_max_num_samples:
-            # Randomly sample validation slices to limit the number of samples
-            logging.info(f"Validation slices length before sampling: {len(val_slices)}")
-            np.random.seed(config.seed)
-            np.random.shuffle(val_slices)
-            val_slices = val_slices[:config.evaluation.validation_max_num_samples]
-            logging.info(f"Validation slices length after sampling: {len(val_slices)}")    
+    train_files = json.dumps(train_files)
+    val_files = json.dumps(val_files)
 
-        train_files = json.dumps(train_slices)
-        val_files = json.dumps(val_slices)
-
-    else:
-        train_files = None
-        val_files = None
-
-    train_files = idist.utils.broadcast(train_files, src=0, safe_mode=True)
-    val_files = idist.utils.broadcast(val_files, src=0, safe_mode=True)
-        
-    # Convert JSON strings back to lists of dictionaries
-    train_files = json.loads(train_files) if isinstance(train_files, str) else train_files
-    val_files = json.loads(val_files) if isinstance(val_files, str) else val_files
 
     train_transforms = Compose(
         [
@@ -519,11 +485,6 @@ def get_dataloaders(config, aim_logger, rank):
             ),
             Lambdad(keys=[Keys.LABEL], func=threshold_label),
   
-            GetSliced(
-                keys=[Keys.IMAGE, Keys.LABEL],
-                slice_key="slice_idx",
-                axis=config.data.slice_axis,
-            ),
             RandSpatialCropd(
                 keys=[Keys.IMAGE, Keys.LABEL],
                 roi_size=config.data.roi_size,
@@ -550,11 +511,7 @@ def get_dataloaders(config, aim_logger, rank):
                 axcodes=config.data.orientation,
             ),
             Lambdad(keys=[Keys.LABEL], func=threshold_label),
-            GetSliced(
-                keys=[Keys.IMAGE, Keys.LABEL],
-                slice_key="slice_idx",
-                axis=config.data.slice_axis,
-            ),
+            
             ResizeWithPadOrCropd(
                 keys=[Keys.IMAGE, Keys.LABEL],
                 spatial_size=config.data.roi_size,

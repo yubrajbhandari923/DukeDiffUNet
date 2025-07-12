@@ -43,6 +43,7 @@ class MedSegDiffModel:
             use_fp16=model_config.use_fp16,
             use_new_attention_order=model_config.use_new_attention_order,
             version=model_config.version,
+            dims=model_config.dims,  # Yubraj Added
         )
         
         self.diffusion = create_gaussian_diffusion(

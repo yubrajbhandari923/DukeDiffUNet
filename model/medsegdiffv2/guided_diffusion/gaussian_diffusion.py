@@ -240,7 +240,6 @@ class GaussianDiffusion:
         )
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-
     def p_mean_variance(
         self, model, x, t, clip_denoised=True, denoised_fn=None, model_kwargs=None
     ):
@@ -273,6 +272,9 @@ class GaussianDiffusion:
         if isinstance(model_output, tuple):
             model_output, cal = model_output
         x=x[:,-1:,...]  #loss is only calculated on the last channel, not on the input brain MR image
+        model_output = model_output[
+            :, -1:, ...
+        ]  # loss is only calculated on the last channel, not on the input brain MR image
         if self.model_var_type in [ModelVarType.LEARNED, ModelVarType.LEARNED_RANGE]:
             assert model_output.shape == (B, C * 2, *x.shape[2:])
             model_output, model_var_values = th.split(model_output, C, dim=1)
@@ -340,8 +342,6 @@ class GaussianDiffusion:
             'cal': cal,
         }
 
-
-
     def _predict_xstart_from_eps(self, x_t, t, eps):
         assert x_t.shape == eps.shape, f"x_t shape {x_t.shape} != eps shape {eps.shape}"
         return (
@@ -381,7 +381,6 @@ class GaussianDiffusion:
         """
         a, gradient = cond_fn(x, self._scale_timesteps(t),org,  **model_kwargs)
 
-
         new_mean = (
             p_mean_var["mean"].float() + p_mean_var["variance"] * gradient.float()
         )
@@ -408,7 +407,6 @@ class GaussianDiffusion:
             x_start=out["pred_xstart"], x_t=x, t=t
         )
         return out, eps
-
 
     def sample_known(self, img, batch_size = 1):
         image_size = self.image_size
@@ -502,7 +500,6 @@ class GaussianDiffusion:
             final = sample
         return final["sample"]
 
-
     def p_sample_loop_known(
         self,
         model,
@@ -551,7 +548,14 @@ class GaussianDiffusion:
                 method="multistep",
             )
             sample = sample.detach()    ### MODIFIED: for DPM-Solver OOM issue
-            sample[:,-1,:,:] = norm(sample[:,-1,:,:])
+            sample[:,-1,:,:] = norm(sample[:,-1,:,:], eps=1e-5)  #normalize the last channel, which is the segmentation mask
+
+            # # norm gave Nan values, so we normalize the last channel manually
+            # m = sample[:, -1, ...]
+            # mn, mx = m.min(), m.max()
+            # rng = mx - mn
+            # sample[:, -1, ...] = (m - mn) / (rng + 1e-5)
+
             final["sample"] = sample
             final["cal"] = cal
 
@@ -592,7 +596,6 @@ class GaussianDiffusion:
                 cal_out = torch.clamp(final["cal"] + 0.25 * final["sample"][:,-1,:,:].unsqueeze(1), 0, 1)
             else:
                 cal_out = torch.clamp(final["cal"] * 0.5 + 0.5 * final["sample"][:,-1,:,:].unsqueeze(1), 0, 1)
-            
 
         return final["sample"], x_noisy, img, final["cal"], cal_out
 
@@ -635,11 +638,11 @@ class GaussianDiffusion:
             indices = tqdm(indices)
 
         else:
-           for i in indices:
+            for i in indices:
                 t = th.tensor([i] * shape[0], device=device)
                 # if i%100==0:
-                    # print('sampling step', i)
-                    # viz.image(visualize(img.cpu()[0, -1,...]), opts=dict(caption="sample"+ str(i) ))
+                # print('sampling step', i)
+                # viz.image(visualize(img.cpu()[0, -1,...]), opts=dict(caption="sample"+ str(i) ))
 
                 with th.no_grad():
                     # print('img bef size',img.size())
@@ -681,7 +684,6 @@ class GaussianDiffusion:
             model_kwargs=model_kwargs,
         )
 
-
         if cond_fn is not None:
             out = self.condition_score(cond_fn, out, x, t, model_kwargs=model_kwargs)
 
@@ -708,7 +710,6 @@ class GaussianDiffusion:
         )  # no noise when t == 0
         sample = mean_pred + nonzero_mask * sigma * noise
         return {"sample": sample, "pred_xstart": out["pred_xstart"]}
-
 
     def ddim_reverse_sample(
         self,
@@ -747,8 +748,6 @@ class GaussianDiffusion:
         )
 
         return {"sample": mean_pred, "pred_xstart": out["pred_xstart"]}
-
-
 
     def ddim_sample_loop_interpolation(
         self,
@@ -833,10 +832,8 @@ class GaussianDiffusion:
         ):
 
             final = sample
-       # viz.image(visualize(final["sample"].cpu()[0, ...]), opts=dict(caption="sample"+ str(10) ))
+        # viz.image(visualize(final["sample"].cpu()[0, ...]), opts=dict(caption="sample"+ str(10) ))
         return final["sample"]
-
-
 
     def ddim_sample_loop_known(
             self,
@@ -882,7 +879,6 @@ class GaussianDiffusion:
 
         return final["sample"], x_noisy, img
 
-
     def ddim_sample_loop_progressive(
         self,
         model,
@@ -912,7 +908,6 @@ class GaussianDiffusion:
         indices = list(range(time-1))[::-1]
         orghigh = img[:, :-1, ...]
 
-
         if progress:
             # Lazy import so that we don't depend on tqdm.
             from tqdm.auto import tqdm
@@ -920,12 +915,12 @@ class GaussianDiffusion:
             indices = tqdm(indices)
 
         for i in indices:
-                t = th.tensor([i] * shape[0], device=device)
-                with th.no_grad():
-                 if img.shape != (1, 5, 224, 224):
-                     img = torch.cat((orghigh,img), dim=1).float()
+            t = th.tensor([i] * shape[0], device=device)
+            with th.no_grad():
+                if img.shape != (1, 5, 224, 224):
+                    img = torch.cat((orghigh,img), dim=1).float()
 
-                 out = self.ddim_sample(
+                out = self.ddim_sample(
                     model,
                     img,
                     t,
@@ -935,8 +930,8 @@ class GaussianDiffusion:
                     model_kwargs=model_kwargs,
                     eta=eta,
                  )
-                yield out
-                img = out["sample"]
+            yield out
+            img = out["sample"]
 
     def _vb_terms_bpd(
         self, model, x_start, x_t, t, clip_denoised=True, model_kwargs=None
@@ -971,8 +966,6 @@ class GaussianDiffusion:
         output = th.where((t == 0), decoder_nll, kl)
         return {"output": output, "pred_xstart": out["pred_xstart"]}
 
-
-
     def training_losses_segmentation(self, model, classifier, x_start, t, model_kwargs=None, noise=None):
         """
         Compute training losses for a single timestep.
@@ -990,7 +983,6 @@ class GaussianDiffusion:
         if noise is None:
             noise = th.randn_like(x_start[:, -1:, ...])
 
-
         mask = x_start[:, -1:, ...]
         res = torch.where(mask > 0, 1, 0)   #merge all tumor classes into one to get a binary segmentation mask
 
@@ -998,7 +990,6 @@ class GaussianDiffusion:
         x_t=x_start.float()
         x_t[:, -1:, ...]=res_t.float()
         terms = {}
-
 
         if self.loss_type == LossType.MSE or self.loss_type == LossType.BCE_DICE or self.loss_type == LossType.RESCALED_MSE:
 
@@ -1038,7 +1029,7 @@ class GaussianDiffusion:
             # terms["loss_diff"] = nn.BCELoss(model_output, target)
             terms["loss_diff"] = mean_flat((target - model_output) ** 2 )
             terms["loss_cal"] = mean_flat((res - cal) ** 2)
-            # terms["loss_cal"] = nn.BCELoss()(cal.type(th.float), res.type(th.float)) 
+            # terms["loss_cal"] = nn.BCELoss()(cal.type(th.float), res.type(th.float))
             # terms["mse"] = (terms["mse_diff"] + terms["mse_cal"]) / 2.
             if "vb" in terms:
                 terms["loss"] = terms["loss_diff"] + terms["vb"]
@@ -1049,7 +1040,6 @@ class GaussianDiffusion:
             raise NotImplementedError(self.loss_type)
 
         return (terms, model_output)
-
 
     def _prior_bpd(self, x_start):
         """

@@ -37,3 +37,12 @@ Questions right now:
 - Also, the results showed basically all zeros generating.
 - 
 
+## 🧪 Experiment Log – 2025-07-03
+
+🔹 Purpose of Schedule Sampler
+The purpose of a schedule sampler is to:
+ - Control the distribution of timesteps sampled during training.
+- Improve training efficiency by prioritizing timesteps where the model is underperforming or where gradients are more informative.
+ - Balance learning across the full diffusion trajectory — from clean images (t = 0) to highly noised images (t = T).
+
+Without a smart sampler, the model may waste training capacity on timesteps that don’t need much improvement.

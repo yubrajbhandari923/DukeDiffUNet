@@ -4,6 +4,10 @@ import logging
 import torch
 import json
 
+import imageio.v2 as imageio
+from io import BytesIO
+# import cv2
+
 # from ignite.handlers.base_logger import BaseHandler
 from aim import Figure, Image
 import plotly.express as px
@@ -81,17 +85,22 @@ class AimIgnite3DImageHandler:
         global_step_transform=None,
         plot_once=False,
         log_unique_values=True,
+        postprocess=None
     ):
         self.tag = tag
         self.output_transform = output_transform
         self.global_step_transform = global_step_transform
         self.plot_once = plot_once
         self.log_unique_values = log_unique_values
+        self.postprocess = postprocess
 
     def __call__(self, engine, logger, event_name):
 
         if self.output_transform is not None:
-            img = self.output_transform(engine.state.output)
+            img, label, pred = self.output_transform(engine.state.output)
+            img = img[0]  # Assuming batch size of 1
+            label = label[0]  # Assuming batch size of 1
+            pred = pred[0]  # Assuming batch size of 1
 
         img_name = (
             img.meta["filename_or_obj"]
@@ -104,42 +113,66 @@ class AimIgnite3DImageHandler:
         if self.plot_once and tag_name in AimIgnite3DImageHandler.plotted_tags:
             return
 
-        if len(img.shape) == 5 or len(img.shape) == 4:
-            img = img.squeeze()
+        
+        # if len(img.shape) == 5 or len(img.shape) == 4:
+        img = img.squeeze()
+        label = label.squeeze()
+        pred = pred.squeeze()
+        
+        label = torch.argmax(label, dim=0, keepdim=False)
+        pred = torch.argmax(pred, dim=0, keepdim=False)
 
-        if len(img.shape) == 4:
-            img = torch.argmax(img, dim=0)
-
+        assert len(img.shape) == 3, f"Image shape {img.shape} is not 3D. Expected 3D images for visualizations."
+        assert len(label.shape) == 3, f"Label shape {label.shape} is not 3D. Expected 3D labels for visualizations."
+        assert len(pred.shape) == 3, f"Prediction shape {pred.shape} is not 3D. Expected 3D predictions for visualizations."
+        
         img_data = img.cpu().numpy()
+        label_data = label.cpu().numpy()
+        pred_data = pred.cpu().numpy()
+        
+        
+        # Get the slice with maximum volume in label data
+        # if label_data.ndim == 3:
+        
+        max_slice_index = np.argmax(np.sum(label_data > 0, axis=(0, 1)))
+        img_data = img_data[:,:,max_slice_index]
+        label_data = label_data[:,:,max_slice_index]
+        pred_data = pred_data[:,:,max_slice_index]
 
-        volume = np.sum(img_data[img_data > 0]) / 1000
-        unique_values = torch.unique(img).cpu()
+        tag_name = f"{self.tag} {img_name} slice {max_slice_index}"
+        
+        fig = plot_image_label_pred(
+            img_name, img_data, label_data, pred_data)
+        # volume = np.sum(img_data[img_data > 0]) / 1000
+        # label_volume = np.sum(label_data[label_data > 0]) / 1000
+        
+        # unique_values = torch.unique(img).cpu()
 
-        fig = get_big_fig(
-            img_data,
-            title=img_name,
-            table_data={
-                "header": ["Key", "Value"],
-                "data": [
-                    [
-                        "Tag",
-                        "Shape",
-                        "Total Volume",
-                        "Unique Values",
-                        "Full Patient Name",
-                    ],
-                    [self.tag, str(img_data.shape), volume, unique_values, img_name],
-                ],
-            },
-            n_every=5,
-        )
+        # fig = get_big_fig(
+        #     img_data,
+        #     title=img_name,
+        #     table_data={
+        #         "header": ["Key", "Value"],
+        #         "data": [
+        #             [
+        #                 "Label Volume",
+        #                 "Shape",
+        #                 "Prediction Volume",
+        #                 "Unique Values",
+        #                 "Full Patient Name",
+        #             ],
+        #             [label_volume, str(img_data.shape), volume, unique_values, img_name],
+        #         ],
+        #     },
+        #     n_every=5,
+        # )
 
         if self.global_step_transform is not None:
             global_step = self.global_step_transform(engine, Events.EPOCH_COMPLETED)
         else:
             global_step = engine.state.get_event_attrib_value(event_name)
 
-        logger.experiment.track(Figure(fig), name=tag_name, step=global_step)
+        logger.experiment.track(Image(fig), name=tag_name, step=global_step)
 
         if self.log_unique_values:
             unique_values = torch.unique(img).cpu()
@@ -174,6 +207,8 @@ class AimIgnite2DImageHandler:
         self.global_step_transform = global_step_transform
         self.plot_once = plot_once
 
+        self.visualize_cases = None
+
     def __call__(self, engine, logger, event_name):
 
         if self.output_transform is not None:
@@ -205,8 +240,6 @@ class AimIgnite2DImageHandler:
                 raise ValueError(
                     f"Image shape {img.shape}, Label Shape {lbl.shape}, Pred Shape {prd.shape} is not 2D. Expected 2D images for visualizations."
                 )
-                
-            logging.info(f"Unique values in label: {torch.unique(lbl)}, Unique values in pred: {torch.unique(prd)}")
 
             # fig = plot_2d_images(img_name, img_data, label_data, pred_data)
             fig = plot_image_label_pred(
@@ -216,8 +249,114 @@ class AimIgnite2DImageHandler:
                 global_step = self.global_step_transform(engine, Events.EPOCH_COMPLETED)
             else:
                 global_step = engine.state.get_event_attrib_value(event_name)
+
+            # logging.info(f"Unique values in label: {torch.unique(lbl)}, Unique values in pred: {torch.unique(prd)}")
+            logging.info(f" Unique values length: Label: {len(torch.unique(lbl))}, Prediction: {len(torch.unique(prd))}")
+            logging.info(f"Visualizing {img_name} at step {global_step}")
+
             logger.experiment.track(Image(fig), name=tag_name, step=global_step)
             AimIgnite2DImageHandler.plotted_tags.add(tag_name)
+
+
+class AimIgniteGIFHandler:
+    """
+    Ignite handler that turns a 3D image, its ground truth mask, and its prediction
+    into a three‐column animated GIF and logs it to Aim.
+    """
+
+    plotted_tags = set()
+
+    def __init__(
+        self,
+        tag: str,
+        output_transform = None,
+        global_step_transform = None,
+        plot_once: bool = False,
+        axis: int = 2,
+        fps: int = 2,
+        vmin: float = None,
+        vmax: float = None,
+    ):
+        """
+        Args:
+            tag: base tag name under which GIFs will be logged
+            output_transform: function(engine_output) -> (images, labels, preds)
+            global_step_transform: function(engine, event) -> int
+            plot_once: if True, only log each case once
+            axis: axis along which to slice the 3D volume (0,1,2)
+            fps: frames per second for the GIF
+            vmin/vmax: intensity range for the image column (optional)
+        """
+        self.tag = tag
+        self.output_transform = output_transform
+        self.global_step_transform = global_step_transform
+        self.plot_once = plot_once
+        self.axis = axis
+        self.fps = fps
+        self.vmin = vmin
+        self.vmax = vmax
+
+    def __call__(self, engine, logger, event_name: str):
+        # pull out (batch_images, batch_labels, batch_preds)
+        if self.output_transform is not None:
+            images, labels, preds = self.output_transform(engine.state.output)
+        else:
+            raise RuntimeError("AimIgniteGIFHandler requires an output_transform")
+
+        # iterate through the batch
+        for img, gt, pr in zip(images, labels, preds):
+            # derive a unique tag per volume (you can customize this)
+            basename = (
+                img.meta["filename_or_obj"]
+                .split("/")[-1]
+                .split(".")[0]
+                .replace("_trans", "")
+            )
+            tag_name = f"{self.tag}/{basename}"
+            if self.plot_once and tag_name in AimIgniteGIFHandler.plotted_tags:
+                continue
+
+            # squeeze out any singleton dims and move to CPU+numpy
+            img_np = img.squeeze().cpu().numpy()
+            gt_np = gt.squeeze().cpu().numpy()
+            pr_np = pr.squeeze().cpu().numpy()
+
+            # SAnity CHecks
+            first_im = np.take(img_np, 0, axis=self.axis)
+            first_gt = np.take(gt_np,  0, axis=self.axis)
+            first_pr = np.take(pr_np,  0, axis=self.axis)
+
+            # Log shapes and data ranges:
+            logger.experiment.log_info(f"{tag_name} slice0 shapes: im{first_im.shape}, gt{first_gt.shape}, pr{first_pr.shape}")
+            logger.experiment.log_info(f"{tag_name} image min/max = {first_im.min():.3f}/{first_im.max():.3f}")
+            logger.experiment.log_info(f"{tag_name} gt unique vals = {np.unique(first_gt)}")
+            logger.experiment.log_info(f"{tag_name} pr unique vals = {np.unique(first_pr)}")
+            
+            # generate the GIF bytes
+            fig = make_segmentation_figure(
+                image3d=img_np,
+                gt3d=gt_np,
+                pred3d=pr_np,
+                axis=self.axis,
+                fps=self.fps,
+                vmin=self.vmin,
+                vmax=self.vmax,
+            )
+
+            # determine global step
+            if self.global_step_transform is not None:
+                step = self.global_step_transform(engine, event_name)
+            else:
+                step = engine.state.get_event_attrib_value(event_name)
+
+            # log raw GIF bytes—Aim will render it as an animated image
+            logger.experiment.track(
+                Figure(fig),
+                name=tag_name,
+                step=step,
+            )
+
+            AimIgniteGIFHandler.plotted_tags.add(tag_name)
 
 
 def normalize_uint8(x):
@@ -261,11 +400,11 @@ def plot_image_label_pred(title, image, label, pred):
     Plot image, label, and prediction side by side.
     """
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-    axes[0].imshow(image.cpu().numpy(), cmap="gray")
+    axes[0].imshow(image, cmap="gray")
     axes[0].set_title("Image")
-    axes[1].imshow(label.cpu().numpy(), cmap="gray")
+    axes[1].imshow(label, cmap="gray")
     axes[1].set_title("Label")
-    axes[2].imshow(pred.cpu().numpy(), cmap="gray")
+    axes[2].imshow(pred, cmap="gray")
     axes[2].set_title("Prediction")
 
     # Add title to the figure if provided
@@ -547,6 +686,155 @@ def get_big_fig(img_data, title="Image", table_data=None, n_every=5):
     fig.add_trace(go.Heatmap(z=y_slice, colorscale="Viridis"), row=2, col=2)
 
     fig.update_layout(title=title, width=1000, height=1000)
+
+    return fig
+
+
+def make_segmentation_figure(
+    image3d: np.ndarray,
+    gt3d: np.ndarray,
+    pred3d: np.ndarray,
+    axis: int = 0,
+    fps: int = 2,
+    vmin: float = None,
+    vmax: float = None,
+) -> go.Figure:
+    """
+    Build a Plotly animation Figure showing:
+      • col 1: raw image slices
+      • col 2: ground-truth mask slices
+      • col 3: predicted mask slices
+
+    Controls: play / pause buttons + slider.
+
+    Returns a go.Figure with .frames, suitable for Aim’s Figure() tracking.
+    """
+    # --- prepare & normalize ---
+    img = image3d.astype(np.float32)
+    gt = gt3d.astype(np.float32)
+    pr = pred3d.astype(np.float32)
+
+    if vmin is None:
+        vmin = float(np.min(img))
+    if vmax is None:
+        vmax = float(np.max(img))
+
+    n_slices = img.shape[axis]
+    # collect all slice-triplets
+    slices = []
+    for i in range(n_slices):
+        sl = [slice(None)] * 3
+        sl[axis] = i
+        slices.append(
+            (
+                img[tuple(sl)],
+                gt[tuple(sl)],
+                pr[tuple(sl)],
+            )
+        )
+
+    # --- initial figure with slice 0 ---
+    fig = make_subplots(
+        rows=1,
+        cols=3,
+        subplot_titles=("Image", "Ground Truth", "Prediction"),
+        horizontal_spacing=0.02,
+    )
+
+    im0, gt0, pr0 = slices[0]
+    fig.add_trace(
+        go.Heatmap(z=im0, colorscale="Gray", zmin=vmin, zmax=vmax, showscale=False),
+        row=1,
+        col=1,
+    )
+    fig.add_trace(go.Heatmap(z=gt0, colorscale="Gray", showscale=False,zmin=0, zmax=1), row=1, col=2)
+    fig.add_trace(go.Heatmap(z=pr0, colorscale="Gray", showscale=False,zmin=0, zmax=1), row=1, col=3)
+
+    # --- build frames for each slice ---
+    frames = []
+    frame_duration = int(1000 / fps)
+    for idx, (im_slice, gt_slice, pr_slice) in enumerate(slices):
+        frames.append(
+            go.Frame(
+                data=[
+                    go.Heatmap(
+                        z=im_slice,
+                        colorscale="Gray",
+                        zmin=vmin,
+                        zmax=vmax,
+                        showscale=False,
+                    ),
+                    go.Heatmap(z=gt_slice, colorscale="Gray", showscale=False),
+                    go.Heatmap(z=pr_slice, colorscale="Gray", showscale=False),
+                ],
+                name=str(idx),
+            )
+        )
+    fig.frames = frames
+
+    # --- slider steps ---
+    steps = []
+    for idx in range(n_slices):
+        steps.append(
+            {
+                "method": "animate",
+                "args": [
+                    [str(idx)],
+                    {
+                        "mode": "immediate",
+                        "frame": {"duration": frame_duration, "redraw": True},
+                        "transition": {"duration": 0},
+                    },
+                ],
+                "label": str(idx),
+            }
+        )
+
+    # --- layout: buttons + slider ---
+    fig.update_layout(
+        updatemenus=[
+            {
+                "type": "buttons",
+                "buttons": [
+                    {
+                        "label": "Play",
+                        "method": "animate",
+                        "args": [
+                            None,
+                            {
+                                "frame": {"duration": frame_duration, "redraw": True},
+                                "fromcurrent": True,
+                                "transition": {"duration": 0},
+                            },
+                        ],
+                    },
+                    {
+                        "label": "Pause",
+                        "method": "animate",
+                        "args": [
+                            [None],
+                            {
+                                "frame": {"duration": 0, "redraw": False},
+                                "mode": "immediate",
+                                "transition": {"duration": 0},
+                            },
+                        ],
+                    },
+                ],
+                "direction": "left",
+                "pad": {"r": 10, "t": 70},
+                "showactive": False,
+                "x": 0.1,
+                "xanchor": "right",
+                "y": 0,
+                "yanchor": "top",
+            }
+        ],
+        sliders=[{"active": 0, "pad": {"b": 10, "t": 60}, "steps": steps}],
+        margin={"l": 0, "r": 0, "t": 30, "b": 0},
+        height=300,
+        width=900,
+    )
 
     return fig
 

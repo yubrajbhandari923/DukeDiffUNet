@@ -1,6 +1,6 @@
 #!/bin/bash
 
-PIDFILE="/home/yb107/logs/train_medsegdiff.pid"
+PIDFILE="/home/yb107/logs/train_.pid"
 
 if [ ! -f "$PIDFILE" ]; then
     echo "❌ PID file not found: $PIDFILE"

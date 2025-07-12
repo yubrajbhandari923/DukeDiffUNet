@@ -1084,7 +1084,8 @@ class UNetModel_newpreview(nn.Module):
             assert y.shape == (x.shape[0],)
             emb = emb + self.label_emb(y)
 
-        h = x.type(self.dtype)
+        # h = x.type(self.dtype) # Yubraj commented to support torch autocast
+        h = x
         c = h[:,:-1,...]
         anch, cal = self.highway_forward(c)
         for ind, module in enumerate(self.input_blocks):
@@ -1327,7 +1328,8 @@ class EncoderUNetModel(nn.Module):
         emb = self.time_embed(timestep_embedding(timesteps, self.model_channels))
 
         results = []
-        h = x.type(self.dtype)
+        # h = x.type(self.dtype) # Yubraj commented to support torch autocast
+        h = x
         for module in self.input_blocks:
             h = module(h, emb)
             if self.pool.startswith("spatial"):

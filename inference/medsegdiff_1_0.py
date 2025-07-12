@@ -22,6 +22,8 @@ from ignite.handlers import EarlyStopping, ModelCheckpoint, global_step_from_eng
 import ignite.distributed as idist
 from ignite.distributed.auto import auto_dataloader, auto_model, auto_optim
 from torch.optim.swa_utils import AveragedModel
+from collections import OrderedDict
+
 
 import monai
 from monai.transforms import (
@@ -71,7 +73,7 @@ import torch.multiprocessing as tmp_mp
 
 tmp_mp.set_sharing_strategy("file_system")
 
-DEBUG = False
+DEBUG = True
 # region utils (EMA update, get_args, update_ema)
 
 def get_args():
@@ -99,6 +101,22 @@ def get_args():
     config = OmegaConf.merge(base_cfg, exp_cfg)
 
     return config
+
+
+def strip_ddp_prefix(state_dict, prefix="module.", keep_once=True):
+    new_state_dict = OrderedDict()
+    for k, v in state_dict.items():
+        # peel off *all* leading "module." occurrences
+        new_key = k
+        while new_key.startswith(prefix):
+            new_key = new_key[len(prefix):]
+        
+        if keep_once:
+            new_state_dict[prefix + new_key] = v
+        else:
+            new_state_dict[new_key] = v
+   
+    return new_state_dict
 
 # endregion
 
@@ -145,7 +163,6 @@ def train_step(engine, batchdata):
 
     if isinstance(engine.schedule_sampler, LossAwareSampler):
         engine.schedule_sampler.update_with_local_losses(t, loss_dict["loss"].detach())
-        
     loss = (loss_dict["loss"] * weights + loss_dict["loss_cal"] * 10).mean()
 
     
@@ -158,10 +175,6 @@ def train_step(engine, batchdata):
         loss.backward()
         optimizer.step()
 
-    for name, param in engine.network.named_parameters():
-        if param.grad is None:
-            logging.warning(f"Parameter {name} has no gradient. This may indicate an issue with the model or data.")
-            
     # 5) return whatever you need in metrics/handlers
     #    here we return a dict so StatsHandler can pick out "loss"
     return {"loss": loss, "pred": sample, "label": labels}
@@ -182,14 +195,13 @@ def eval_step(engine, batchdata):
     # )
 
     # 1) prepare
-    image, masks = engine.prepare_batch(
+    inputs, targets = engine.prepare_batch(
         batchdata, engine.state.device, engine.non_blocking
     )
-    config = engine.config
 
     # 2) noisy condition
-    noise = torch.randn_like(image[:, :1, ...])
-    cond = torch.cat((image, noise), dim=1)
+    noise = torch.randn_like(inputs[:, :1, ...])
+    img = torch.cat((inputs, noise), dim=1)
 
     # 3) repeated sampling
     votes = []
@@ -198,37 +210,43 @@ def eval_step(engine, batchdata):
             if not engine.ddim:
                 out = engine.diffusion.p_sample_loop_known(
                     engine.network,
-                    (image.shape[0], 2, *image.shape[2:]),
-                    cond,
-                    step=config.diffusion.diffusion_steps,
-                    noise=None,
-                    clip_denoised=config.diffusion.clip_denoised,
+                    (inputs.shape[0], 2, *inputs.shape[2:]),
+                    img,
+                    step=1000, # different 
+                    clip_denoised=True,
                     model_kwargs={},
-                    device=engine.state.device,
-                    progress=False,
                 )
             else:
                 out = engine.diffusion.ddim_sample_loop_known(
                     engine.network,
-                    (image.shape[0], 2, *image.shape[2:]),
-                    cond,
+                    (inputs.shape[0], 2, *inputs.shape[2:]),
+                    img,
                     step=engine.diffusion.num_timesteps,
-                    noise=None,
-                    clip_denoised=False,
+                    clip_denoised=True,
                     model_kwargs={},
-                    device=engine.state.device,
-                    progress=False,
                 )
             sample, *_ = out
+            
+            if torch.isnan(sample).any():
+                logging.info("NaNs detected in diffusion sample output!")
+                raise ValueError("NaNs detected in diffusion sample output!")
+                
             votes.append(sample[:, -1, :, :])
 
     pred = staple(torch.stack(votes, dim=0)).squeeze(0)
+    # logging.info("PRED:", pred.shape, pred.min().item(), pred.max().item())
+    # print("TARGET:", targets.shape, torch.unique(targets))
+    
+    # logging.info(
+    #     f"Pred: {pred.shape}, min: {pred.min().item()}, max: {pred.max().item()}"
+    # )
+    # logging.info(
+    #     f"Target: {targets.shape}, unique: {torch.unique(targets)}"
+    # )
 
-    pred = pred.unsqueeze(1)  # Add channel dimension
-    pred = (pred > 0.5).to(torch.int32)
-    # logging.info(f"Images shape: {image.shape}, Labels shape: {masks.shape}, Predictions shape: {pred.shape}")
-
-    return {"image": image, "y_pred": pred, "y": masks}
+    # 4) return a dict with keys "pred" and "label"
+    #    MONAI's Evaluator will pick those up for metrics
+    return {"image": inputs, "y_pred": pred, "y": targets}
 
 # endregion
 
@@ -480,7 +498,7 @@ def get_dataloaders(config, aim_logger, rank):
         
         if DEBUG:
             train_slices = train_slices[:64]
-            val_slices = val_slices[:32]
+            val_slices = val_slices[:30]
 
         if len(val_slices) > config.evaluation.validation_max_num_samples:
             # Randomly sample validation slices to limit the number of samples
@@ -489,6 +507,14 @@ def get_dataloaders(config, aim_logger, rank):
             np.random.shuffle(val_slices)
             val_slices = val_slices[:config.evaluation.validation_max_num_samples]
             logging.info(f"Validation slices length after sampling: {len(val_slices)}")    
+        
+        if config.evaluation.visualize:
+            rem = len(val_slices) % config.evaluation.visualize_num_samples
+            logging.info(f"To visualize, we need to have a multiple of {config.evaluation.visualize_num_samples} samples. Current length: {len(val_slices)}")
+
+            if rem > 0:
+                val_slices = val_slices[:-rem]
+                logging.info(f"Validation slices length after adjustment: {len(val_slices)}")
 
         train_files = json.dumps(train_slices)
         val_files = json.dumps(val_slices)
@@ -621,16 +647,41 @@ def build_model(config, rank):
     if config.training.resume is not None:
         state_dict = torch.load(config.training.resume, map_location=f"cuda:{rank}")
 
-        net.load_state_dict(state_dict["network"], strict=False)
-        opt.load_state_dict(state_dict["optimizer"])
-        ema_model.load_state_dict(state_dict.get("ema_model", ema_model.state_dict()))
+        if "network" not in state_dict:
+            net.load_state_dict(state_dict, strict=False)
+        else:
+            net.load_state_dict(state_dict["network"], strict=False)
+            opt.load_state_dict(state_dict["optimizer"])
+            
+            try:
+                ema_model.load_state_dict(strip_ddp_prefix(state_dict.get("ema_model")))
+            except Exception as e:
+                logging.warning(f"[Rank {rank}] Failed to load EMA model state_dict: {e}")
+                ema_model = AveragedModel(
+                    net,
+                    avg_fn=lambda avg_p, new_p, _: avg_p.mul_(config.model.params.ema_rate).add_(
+                        new_p, alpha=1 - config.model.params.ema_rate
+                    ),
+                )
 
         resume_epoch = str(config.training.resume).split(".")[0].split("_")[-1]
         if "epoch" in state_dict:
             resume_epoch = state_dict["epoch"]
 
         if isinstance(resume_epoch, str):
-            resume_epoch = int(resume_epoch)
+            if resume_epoch.isdigit():
+                resume_epoch = int(resume_epoch)
+            
+            else:
+                # If it's not a digit, we assume it's a string representation of an epoch number
+                logging.warning(f"[Rank {rank}] Resuming from epoch {resume_epoch}")
+                resume_epoch = resume_epoch.split("savedmodel")[-1]
+               
+                if resume_epoch.isdigit():
+                    resume_epoch = int(resume_epoch)
+                else:
+                    resume_epoch = 0
+
         logging.info(f"[Rank {rank}] Resuming from epoch {resume_epoch}")
         logging.info(f"[Rank {rank}] Model loaded successfully")
     else:
@@ -691,20 +742,8 @@ def attach_checkpoint_handler(trainer, net, opt, ema_model, config, rank):
             global_step_transform=lambda eng, _: eng.state.epoch,
             save_on_rank=0,
         )
-        latest_ckpt = ModelCheckpoint(
-            dirname=ckpt_dir,
-            filename_prefix=f"{config.experiment.name}_latest",
-            n_saved=1,
-            require_empty=False,
-            create_dir=True,
-            global_step_transform=lambda eng, _: eng.state.epoch,
-            save_on_rank=0,
-        )
         trainer.add_event_handler(
             Events.EPOCH_COMPLETED(every=config.training.save_interval), checkpoint_handler, {"network": net, "optimizer": opt, "ema_model": ema_model}
-        )
-        trainer.add_event_handler(
-            Events.EPOCH_COMPLETED(every=1), latest_ckpt, {"network": net, "optimizer": opt, "ema_model": ema_model}
         )
         logging.info(f"[Rank {rank}] Checkpoint handler attached successfully")
         
@@ -723,7 +762,7 @@ def attach_ema_update(trainer, net, ema_model, config):
 
     def update_ema(engine):
         ema_model.update_parameters(engine.network)  # updates the buffers
-        # logging.info(f"[EMA] updated at iter {engine.state.iteration}")
+        logging.info(f"[EMA] updated at iter {engine.state.iteration}")
 
     trainer.add_event_handler(Events.ITERATION_COMPLETED(every=1), update_ema)
 
@@ -808,7 +847,8 @@ def attach_aim_handlers(trainer, val_evaluator, aim_logger, val_loader, rank, co
                     global_step_transform=global_step_from_engine(trainer),
                 ),
                 event_name=Events.ITERATION_COMPLETED(
-                    every=config.evaluation.visualize_every_iter
+                    # every=max(5, len(val_loader) // config.evaluation.visualize_num_samples)
+                    every=1
                 ),
             )
     except Exception as e:
@@ -872,9 +912,9 @@ def _distributed_run(rank, config):
     trainer.optim_set_to_none = config.optimizer.set_to_none
 
     # post_pred = AsDiscreted(keys=Keys.PRED, argmax=True, to_onehot=2)
-    post_pred = AsDiscreted(keys="y_pred", threshold=0.5, to_onehot=2)
-    # post_pred = AsDiscreted(keys="y_pred", argmax=True, to_onehot=2)
-    post_label = AsDiscreted(keys="y", to_onehot=2)
+    # post_pred = AsDiscreted(keys="pred", argmax=True, to_onehot=2)
+    post_pred = AsDiscreted(keys="pred", threshold=0.5, to_onehot=2)
+    post_label = AsDiscreted(keys="label", to_onehot=2)
 
     metrics = {"Mean Dice": MeanDice(include_background=False)}
 
@@ -883,13 +923,13 @@ def _distributed_run(rank, config):
         val_data_loader=val_loader,
         prepare_batch=prepare_batch,
         iteration_update=eval_step,
-        postprocessing=Compose([post_label, post_pred]),
+        postprocessing=[post_label, post_pred],
         key_val_metric=metrics,
     )
 
     # 4) Attach objects needed during eval
-    val_evaluator.network          = ema_model
-    # val_evaluator.network          = net
+    # val_evaluator.network          = ema_model
+    val_evaluator.network          = net
     val_evaluator.diffusion        = diffusion
     val_evaluator.schedule_sampler = scheduler
     val_evaluator.n_rounds         = config.model.params.n_rounds
@@ -910,16 +950,7 @@ def _distributed_run(rank, config):
     # Add barrier to ensure all processes are ready before starting training
     idist.utils.barrier()
 
-    if rank == 0:
-        logging.info(f"[Rank {rank}] Starting training for {config.training.epochs} epochs")
-        logging.info(f"[Rank {rank}] Training on {len(train_loader.dataset)} training samples")
-        logging.info(f"[Rank {rank}] Validation on {len(val_loader.dataset)} validation samples")
-
-    with TorchProfiler(subdir="trainer_run"):
-        trainer.state.epoch = resume_epoch
-        if resume_epoch > 0:
-            logging.info(f"[Rank {rank}] Resuming training from epoch {resume_epoch}")
-        trainer.run()
+    val_evaluator.run()
 
 if __name__ == "__main__":
     config = get_args()
@@ -927,6 +958,7 @@ if __name__ == "__main__":
     # rank = int(os.environ["LOCAL_RANK"])  # torchrun provides this env var
     # logging.info(f"Running on rank {rank} with world size {world_size}")
     # main(rank, world_size)
-    
+
     with idist.Parallel(backend="nccl", nproc_per_node=torch.cuda.device_count()) as parallel:
-        parallel.run(_distributed_run, config)  
+        parallel.run(_distributed_run, config)  # :contentReference[oaicite:2]{index=2}
+    # _distributed_run(config)
