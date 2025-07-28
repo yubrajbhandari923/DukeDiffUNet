@@ -4,10 +4,10 @@
 # ───────────────────────────────────────────────────────────
 # Basic experiment metadata
 experiment:
-  name: "DiffUNet_3d_vlsm_multiorgan"
+  name: "DiffUNet_3d_vlsm_colon"
   version: 1.2
-  description: "DiffUNet on 3D VLSM dataset for multi organ segmentation"
-  tags: ["DiffUNet", "3D VLSM", "multi_organ"]
+  description: "DiffUNet on 3D VLSM dataset for colon segmentation"
+  tags: ["DiffUNet", "3D VLSM", "colon"]
 
 # ───────────────────────────────────────────────────────────
 # Global seed for reproducibility
@@ -24,22 +24,22 @@ logging:
 # ───────────────────────────────────────────────────────────
 # Data & DataLoader settings
 data:
-  description:        "3d VLSM dataset for abdomenal organs segmentation given by Lavsen"
-  num_classes:        15 # background + 14 organs # Colon is label 4
+  description:        "3d VLSM dataset for colon segmentation given by Lavsen"
+  num_classes:        2 # background + 14 organs # Colon is label 4
+  colon_label:  4 # Label for colon segmentation
   # cache_dir:          "/NAS/user_data/user/yb107/cache_dir"
-  cache_dir:          "/data/usr/yb107/colon_data/cache"
+  cache_dir:          "/data/usr/yb107/colon_data/cache_colon"
   orientation:        "RAS"
   pixdim:             [1.5, 1.5, 2.0]
   roi_size:           [96, 96, 96]
-  # roi_size:           [192, 192, 192]
   # roi_size:           [128, 128, 128]
-  # roi_size:           [256, 256, 256] # Adjusted for multi organ segmentation
+  # roi_size:           [192, 192, 192]
+  # roi_size:           [256, 256, 256] # Adjusted for colon segmentation
   slice_axis:         -1
   
   train_jsonl:        "/home/yb107/cvpr2025/DukeDiffSeg/data/3d_vlsm/3d_vlsm_train.jsonl"
   batch_size:         2
   num_workers:        8
-  micro_batch_size:   1      # for gradient accumulation # Not implemented yet
 
   val_jsonl:          "/home/yb107/cvpr2025/DukeDiffSeg/data/3d_vlsm/3d_vlsm_val.jsonl"
   val_batch_size:     1
@@ -53,7 +53,7 @@ training:
   accumulate_grad_steps: 2
   save_dir:            "/home/yb107/cvpr2025/DukeDiffSeg/outputs"
   save_interval:       5      # epochs
-  resume:              "/home/yb107/cvpr2025/DukeDiffSeg/outputs/diffunet_3d_vlsm_multiorgan/checkpoints/DiffUNet_3d_vlsm_multiorgan_latest_checkpoint_120.pt" # Path to checkpoint to resume from (set to null to not resume)
+  resume:              null # Path to checkpoint to resume from (set to null to not resume)
   
 # ───────────────────────────────────────────────────────────
 # Optimizer & scheduler
@@ -78,13 +78,13 @@ lr_scheduler:
 # Evaluation & early stopping
 evaluation:
   validation_interval:     40        # epochs
-  validation_max_num_samples: 80 
+  validation_max_num_samples: 80
   metrics:               ["dice", "hausdorff"]
   early_stopping:
     enabled: true
     patience: 20
   visualize:             true
-  visualize_every_iter:  4
+  visualize_every_iter:  1 
   save_predictions:      true
   save_pred_interval:    1
 

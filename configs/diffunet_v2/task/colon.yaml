@@ -1,0 +1,4 @@
+target: colon
+model:
+  params:
+    out_channels: 2  # background + colon mask

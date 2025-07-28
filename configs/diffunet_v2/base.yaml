@@ -1,49 +1,40 @@
-# TODO:
-#  - Add grad accumulation support and micro-batch support if necessary
-
-# ───────────────────────────────────────────────────────────
-# Basic experiment metadata
 experiment:
-  name: "DiffUNet_3d_vlsm_multiorgan"
-  version: 1.2
-  description: "DiffUNet on 3D VLSM dataset for multi organ segmentation"
-  tags: ["DiffUNet", "3D VLSM", "multi_organ"]
+  name: "DiffUNet_v2"
+  version: 2.0
+  description: "DiffUNet for generative colon conditioned on surrounding organs"
+  tags: ["DiffUNet", "3D VLSM"]
+  debug: false
 
-# ───────────────────────────────────────────────────────────
-# Global seed for reproducibility
 seed: 42
 
-# ───────────────────────────────────────────────────────────
-# Logging & monitoring
 logging:
   use_aim:       true
   aim_repo:      "/home/yb107/cvpr2025/DukeDiffSeg/aim/"
-  log_interval:  10       # iterations
-  aim_ui_port:   43800
 
-# ───────────────────────────────────────────────────────────
-# Data & DataLoader settings
 data:
-  description:        "3d VLSM dataset for abdomenal organs segmentation given by Lavsen"
-  num_classes:        15 # background + 14 organs # Colon is label 4
+  description:        "3d VLSM dataset for colon segmentation given by Lavsen, but with new combined labels with 22 classes"
+  num_classes:        14     # background + 13 organs
+  colon_label:        1     # Label for colon segmentation
   # cache_dir:          "/NAS/user_data/user/yb107/cache_dir"
-  cache_dir:          "/data/usr/yb107/colon_data/cache"
+  cache_dir:          "/data/usr/yb107/colon_data/cache_v2"
   orientation:        "RAS"
   pixdim:             [1.5, 1.5, 2.0]
   roi_size:           [96, 96, 96]
-  # roi_size:           [192, 192, 192]
   # roi_size:           [128, 128, 128]
-  # roi_size:           [256, 256, 256] # Adjusted for multi organ segmentation
+  # roi_size:           [192, 192, 192]
+  # roi_size:           [256, 256, 256] # Adjusted for colon segmentation
   slice_axis:         -1
   
   train_jsonl:        "/home/yb107/cvpr2025/DukeDiffSeg/data/3d_vlsm/3d_vlsm_train.jsonl"
-  batch_size:         2
-  num_workers:        8
-  micro_batch_size:   1      # for gradient accumulation # Not implemented yet
+  batch_size_per_gpu:         1
+  num_workers_per_gpu:        4
+  shuffle_train_data: true
 
   val_jsonl:          "/home/yb107/cvpr2025/DukeDiffSeg/data/3d_vlsm/3d_vlsm_val.jsonl"
-  val_batch_size:     1
+  val_batch_size:    1
   val_num_workers:    4
+
+  debug_save_data: false  # Save a few samples for debugging
 
 # ───────────────────────────────────────────────────────────
 # Training hyperparameters
@@ -53,7 +44,8 @@ training:
   accumulate_grad_steps: 2
   save_dir:            "/home/yb107/cvpr2025/DukeDiffSeg/outputs"
   save_interval:       5      # epochs
-  resume:              "/home/yb107/cvpr2025/DukeDiffSeg/outputs/diffunet_3d_vlsm_multiorgan/checkpoints/DiffUNet_3d_vlsm_multiorgan_latest_checkpoint_120.pt" # Path to checkpoint to resume from (set to null to not resume)
+  resume:              null # Path to checkpoint to resume from (set to null to not resume)
+  num_gpus:          1      # Number of GPUs to use for training
   
 # ───────────────────────────────────────────────────────────
 # Optimizer & scheduler
@@ -78,15 +70,13 @@ lr_scheduler:
 # Evaluation & early stopping
 evaluation:
   validation_interval:     40        # epochs
-  validation_max_num_samples: 80 
-  metrics:               ["dice", "hausdorff"]
+  validation_max_num_samples: 80
+  metrics:               ["Mean Dice"]
   early_stopping:
     enabled: true
     patience: 20
   visualize:             true
-  visualize_every_iter:  4
-  save_predictions:      true
-  save_pred_interval:    1
+  visualize_every_iter:  1 
 
 # ───────────────────────────────────────────────────────────
 # Model architecture (easy to swap out a different 'model.params' block)
@@ -94,8 +84,8 @@ model:
   name: "DiffUNet"
   params: 
     spatial_dims: 3
-    in_channels: 1
-    out_channels: "${data.num_classes}"  # Number of classes for segmentation
+    in_channels:  ${constraint.model.params.in_channels} # Overridden 
+    out_channels: ${task.model.params.out_channels} # Overridden 
     features: [32, 64, 128, 256, 512, 64]
     activation: ["LeakyReLU", {"negative_slope": 0.1, "inplace": False}]
     beta_schedule: "linear"
@@ -117,10 +107,8 @@ diffusion:
   clip_denoised:     true
   ddim:              false
 
-# ───────────────────────────────────────────────────────────
-# Mixed-precision & AMP settings
+
 amp:
   enabled:           false
   fp16_scale_growth: 1e-3
-
 

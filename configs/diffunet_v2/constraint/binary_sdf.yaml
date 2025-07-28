@@ -1,0 +1,5 @@
+constraint: binary_sdf
+
+model:
+  params:
+    in_channels: 2

@@ -3,11 +3,12 @@ import sys
 import logging
 import json
 import copy
+import monai.data
 import monai.transforms
 import numpy as np
 import argparse
 import functools
-import nibabel
+import nibabel as nib
 
 from typing import Iterable, Callable, Any, Sequence
 import aim
@@ -17,21 +18,25 @@ from omegaconf import OmegaConf
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.amp import GradScaler
-from ignite.engine import Events
+from torch.amp import GradScaler, autocast
+from ignite.engine import Events, Engine, EventEnum
 from ignite.handlers import EarlyStopping, ModelCheckpoint, global_step_from_engine
 import ignite.distributed as idist
 from ignite.distributed.auto import auto_dataloader, auto_model, auto_optim
 from torch.optim.swa_utils import AveragedModel
-from ignite.utils import setup_logger
 
 
 import monai
 from monai import transforms
-from monai.engines.utils import default_metric_cmp_fn, IterationEvents
+from monai.engines.utils import (
+    IterationEvents,
+    default_prepare_batch,
+    default_metric_cmp_fn,
+)
 from monai.handlers import (
     MeanDice,
     StatsHandler,
+    IgniteMetricHandler,
     stopping_fn_from_metric,
     from_engine,
 )
@@ -41,8 +46,7 @@ from monai.utils.enums import CommonKeys as Keys
 from monai.data.utils import pickle_hashing
 from monai.losses.dice import DiceLoss
 from monai.inferers import SlidingWindowInferer
-from monai.metrics import DiceMetric
-from monai.apps import get_logger
+
 
 # from model.medsegdiffv2.guided_diffusion.resample import LossAwareSampler, UniformSampler
 # from model.medsegdiffv2.guided_diffusion.utils import staple
@@ -66,6 +70,8 @@ tmp_mp.set_sharing_strategy("file_system")
 
 DEBUG = False
 # region utils (EMA update, get_args, update_ema)
+
+
 def get_args():
     parser = argparse.ArgumentParser(description="Training script")
 
@@ -90,24 +96,28 @@ def get_args():
     exp_cfg = OmegaConf.load(args.exp_config)
     config = OmegaConf.merge(base_cfg, exp_cfg)
 
-    setup_logger(
-        name="training_logger",  # this is the logger that StatsHandler will use
-        level=logging.INFO,
-        stream=sys.stdout,
-        format="%(asctime)s %(levelname)s: %(message)s",
-        reset=True,  # drop any old handlers on this logger
-    )
     return config
+
 
 # endregion
 
 # region train_step and eval_step:
+
+
 def train_step(engine, batchdata):
-    optimizer = engine.optimizer
-    scaler = engine.scaler_
-    use_amp = engine.amp
-    config = engine.config
-    accum = config.training.accumulate_grad_steps
+    """
+    This will replace your DiffusionTrainer._iteration.
+    Expects these attributes on `engine`:
+      - engine.network
+      - engine.diffusion
+      - engine.schedule_sampler
+      - engine.optimizer
+      - engine.mp_trainer
+      - engine.optim_set_to_none (bool)
+    """
+    # logging.info(
+    #     f"Train [Rank {idist.get_rank()}] Starting step at iteration {engine.state.iteration}"
+    # )
 
     # 1) prepare
     images, labels = engine.prepare_batch(
@@ -115,40 +125,34 @@ def train_step(engine, batchdata):
     )
     images = images.float()
     labels = labels.float()
-    # labels_int = labels.long().squeeze(1)  # Assuming labels are in shape [B, 1, D, H, W]
-
-    # labels_1hot = (
-    #     nn.functional.one_hot(labels_int, num_classes=config.data.num_classes)
-    #     .permute(0, 4, 1, 2, 3)
-    #     .float()
-    # )
-
-    labels_1hot = labels
 
     engine.network.train()
 
-    if engine.state.iteration == 1:
+    optimizer = engine.optimizer
+    scaler = engine.scaler_
+    use_amp = engine.amp
+    config = engine.config
+    accum = config.training.accumulate_grad_steps
+
+    if engine.state.iteration % accum == 1:
         optimizer.zero_grad(set_to_none=engine.optim_set_to_none)
 
     # 3) Train Step
-    x_start = (labels_1hot) * 2 - 1
+    x_start = labels
+
+    x_start = (x_start) * 2 - 1
     x_t, t, noise = engine.network(x=x_start, pred_type="q_sample")
     pred_xstart = engine.network(x=x_t, step=t, image=images, pred_type="denoise")
-    engine.fire_event(IterationEvents.FORWARD_COMPLETED)
 
-    # labels_1hot = labels
-    loss_dice = engine.dice_loss(pred_xstart, labels_1hot)
-    loss_bce = engine.bce(pred_xstart, labels_1hot)
+    loss_dice = engine.dice_loss(pred_xstart, labels)
+    loss_bce = engine.bce(pred_xstart, labels)
 
     pred_xstart = torch.sigmoid(pred_xstart)
-    # pred_xstart = torch.softmax(pred_xstart, dim=1)
-
-    loss_mse = engine.mse(pred_xstart, labels_1hot)
+    loss_mse = engine.mse(pred_xstart, labels)
 
     loss = loss_dice + loss_bce + loss_mse
 
     loss = loss / accum
-    engine.fire_event(IterationEvents.LOSS_COMPLETED)
 
     # backward
     scaler.scale(loss).backward() if use_amp else loss.backward()
@@ -160,20 +164,32 @@ def train_step(engine, batchdata):
             scaler.update()
         else:
             optimizer.step()
-            
-        for name, param in engine.network.named_parameters():
-            if param.grad is None:
-                logging.warning(
-                    f"Parameter {name} has no gradient. This may indicate an issue with the model or data."
-                )
-                
-        optimizer.zero_grad(set_to_none=engine.optim_set_to_none)
 
-    engine.fire_event(IterationEvents.MODEL_COMPLETED)
+    for name, param in engine.network.named_parameters():
+        if param.grad is None:
+            logging.warning(
+                f"Parameter {name} has no gradient. This may indicate an issue with the model or data."
+            )
+
+    # 5) return whatever you need in metrics/handlers
+    #    here we return a dict so StatsHandler can pick out "loss"
     return {"loss": loss * accum, "label": labels}
 
 
 def eval_step(engine, batchdata):
+    """
+    This replaces your DiffusionEvaluator._iteration.
+    Expects these attrs on `engine`:
+      - engine.network
+      - engine.diffusion
+      - engine.schedule_sampler
+      - engine.n_rounds
+      - engine.ddim
+    """
+    # logging.info(
+    #     f"Eval [Rank {idist.get_rank()}] Starting step at iteration {engine.state.iteration}"
+    # )
+
     # 1) prepare
     image, masks = engine.prepare_batch(
         batchdata, engine.state.device, engine.non_blocking
@@ -181,41 +197,80 @@ def eval_step(engine, batchdata):
     image = image.float()
     masks = masks.float()
 
-    engine.state.output = {Keys.IMAGE: image, Keys.LABEL: masks}
-
     config = engine.config
 
-    engine.network.eval()
-
-    with engine.mode(engine.network):
-        model_fn = lambda x: engine.network(image=x, pred_type="ddim_sample")
-        if engine.amp:
-            with torch.autocast("cuda", **engine.amp_kwargs):
-                engine.state.output[Keys.PRED] = engine.inferer(
-                    image, engine.network, pred_type="ddim_sample"
-                )
-        else:
-            # engine.state.output[Keys.PRED] = engine.inferer(image, engine.network, pred_type="ddim_sample")
-            engine.state.output[Keys.PRED] = engine.inferer(image, model_fn)
-
-    # engine.state.output[Keys.PRED] = (engine.state.output[Keys.PRED] + 1) / 2.0
-    engine.state.output[Keys.PRED] = torch.sigmoid(engine.state.output[Keys.PRED])
-
     if DEBUG:
-        raw_logits = engine.state.output[Keys.PRED]
-        logging.info(
-            f"Logits stats: min={raw_logits.min():.4f}, max={raw_logits.max():.4f}, mean={raw_logits.mean():.4f}"
-        )
+        logging.info(f"Eval step: image shape {image.shape}, masks shape {masks.shape}")
 
+    engine.network.eval()
+    output = None
+    with torch.no_grad():
+        output = engine.inferer(image, engine.network, pred_type="ddim_sample")
+
+        output = torch.sigmoid(output)
+
+    if DEBUG or True:
         # Log Shapes and Unique Values
-        logging.info(f"Output shape: {engine.state.output[Keys.PRED].shape}")
-        logging.info(f"Image shape: {image.shape}")
-        logging.info(f"Masks shape: {masks.shape}")
+        logging.info(f"Output shape: {output.shape}, Affine shape: {output.affine.shape}")
+        logging.info(f"Image shape: {image.shape}, Affine shape: {image.affine.shape}")
+        logging.info(f"Masks shape: {masks.shape}, Affine shape: {masks.affine.shape}")
 
-    engine.fire_event(IterationEvents.FORWARD_COMPLETED)
-    engine.fire_event(IterationEvents.MODEL_COMPLETED)
+    engine.state.output = {
+        Keys.PRED: output,
+        Keys.IMAGE: image,
+        Keys.LABEL: masks,
+    }
 
-    return engine.state.output
+    # new_pred = monai.data.MetaTensor(
+    #     output.as,
+    #     meta=image.meta,
+    # )
+    # output = transforms.AsDiscrete(
+    #     argmax=True,
+    # )(output)
+    output = torch.argmax(output, dim=1)
+    output = output.squeeze().to(torch.float32)
+
+    logging.info(f"Output shape after AsDiscrete: {output.shape}")
+    # output = monai.data.MetaTensor(
+    #     output,
+    #     meta=image.meta,
+    #     affine= image.affine.squeeze(),
+    # )
+    # grab the original affine from the batch metadata
+    meta = image.meta
+    affine = meta.get("affine", None)
+    affine = affine.squeeze() if affine is not None else None
+    logging.info(f"Affine shape: {affine.shape if affine is not None else 'None'}")
+    if affine is None:
+        raise RuntimeError("No affine found in image_meta_dict")
+
+    # build NIfTI and save
+    nii = nib.Nifti1Image(output.cpu().numpy(), affine)
+    out_dir = os.path.join(
+        engine.config.training.save_dir,
+        engine.config.experiment.name.lower(),
+        "inference",
+    )
+    os.makedirs(out_dir, exist_ok=True)
+    # derive filename however you like, e.g. by index or from meta["filename_or_obj"]
+    case_id = os.path.basename(meta.get("filename_or_obj")[0])
+    nib.save(nii, os.path.join(out_dir, f"{case_id}_pred.nii.gz"))
+
+    # data = transforms.SaveImaged(
+    #     keys=[Keys.PRED],
+    #     meta_keys=[f"{Keys.IMAGE}_meta_dict"],
+    #     output_dir=os.path.join(
+    #         config.training.save_dir,
+    #         config.experiment.name.lower(),
+    #         "inference",
+    #     ),
+    #     output_postfix="pred",
+    #     separate_folder=False,
+    #     resample=False
+    # )({**batchdata, Keys.PRED: output})
+
+    return {Keys.PRED: output, Keys.IMAGE: image, Keys.LABEL: masks}
 
 
 # endregion
@@ -269,29 +324,8 @@ def get_aim_logger(config):
 
 def threshold_label(x: torch.Tensor, num_classes: int) -> torch.Tensor:
     """Remove values greater than num_classes from the label tensor."""
-    x[x >= num_classes] = 0
+    x[x > num_classes] = 0
     return x
-
-
-def mask_label(x: torch.Tensor, label: int) -> torch.Tensor:
-    """Mask out the specified label in the label tensor."""
-    x[x != label] = 0
-    x[x == label] = 1
-    return x
-
-
-def custom_name_formatter(meta_dict, saver):
-    full_path = meta_dict["filename_or_obj"]
-    base = os.path.basename(full_path)
-    # If the filename itself contains "colon", pull the parent folder as the ID
-
-    if "labels" in full_path.lower():
-        postfix = "_label"
-    else:
-        # strip off ".nii.gz" (7 chars) or any extension
-        postfix = "_image"
-    # saver.file_postfix is either "_image" or "_label"
-    return {"filename": f"{base.replace('.nii.gz', '')}{postfix}"}
 
 
 @profile_block("get_dataloaders")
@@ -306,6 +340,7 @@ def get_dataloaders(config, aim_logger, rank):
                 {
                     Keys.IMAGE: data["image"],
                     Keys.LABEL: data["mask"],
+                    "shape": data["shape"],
                 }
             )
 
@@ -316,22 +351,23 @@ def get_dataloaders(config, aim_logger, rank):
                 {
                     Keys.IMAGE: data["image"],
                     Keys.LABEL: data["mask"],
+                    "shape": data["shape"],
                 }
             )
 
     if rank == 0:
-        aim_logger.experiment.track(
-            aim.Text(f"{json.dumps(train_files, indent=2)}"), name="Training Files", step=1
+        aim_logger.experiment.log_info(
+            f"Training files {json.dumps(train_files, indent=2)}"
         )
         logging.info(f"Training files length: {len(train_files)}")
-        aim_logger.experiment.track(
-            aim.Text(f"{json.dumps(val_files, indent=2)}"), name="Validation Files", step=1
+        aim_logger.experiment.log_info(
+            f"Validation files {json.dumps(val_files, indent=2)}"
         )
         logging.info(f"Validation files length: {len(val_files)}")
 
     if DEBUG:
-        train_files = train_files[:12]
-        val_files = val_files[:4]
+        train_files = train_files[:10]
+        val_files = val_files[:10]
 
     if len(val_files) > config.evaluation.validation_max_num_samples:
         # Randomly sample validation slices to limit the number of samples
@@ -340,10 +376,6 @@ def get_dataloaders(config, aim_logger, rank):
         np.random.shuffle(val_files)
         val_files = val_files[: config.evaluation.validation_max_num_samples]
         logging.info(f"Validation files length after sampling: {len(val_files)}")
-
-    # TODO: Crop foreground for training and validation abdomenal region
-    # TODO: Train seperate model using different Data.jsonl
-    # TODO: Predict 14 classes and only colon on new data
 
     train_transform = transforms.Compose(
         [
@@ -381,42 +413,26 @@ def get_dataloaders(config, aim_logger, rank):
                     threshold_label, num_classes=config.data.num_classes
                 ),
             ),
+            transforms.AsDiscreted(
+                keys=[Keys.LABEL],
+                to_onehot=config.data.num_classes,
+            ),
             transforms.RandCropByPosNegLabeld(
                 keys=[Keys.IMAGE, Keys.LABEL],
                 label_key=Keys.LABEL,
                 spatial_size=(96, 96, 96),
-                pos=5,
+                pos=1,
                 neg=1,
-                num_samples=4 if not DEBUG else 1,
+                num_samples=4,
                 image_key=Keys.IMAGE,
                 image_threshold=0,
             ),
             # transforms.RandFlipd(keys=[Keys.IMAGE, Keys.LABEL], prob=0.2, spatial_axis=0),
             # transforms.RandFlipd(keys=[Keys.IMAGE, Keys.LABEL], prob=0.2, spatial_axis=1),
             # transforms.RandFlipd(keys=[Keys.IMAGE, Keys.LABEL], prob=0.2, spatial_axis=2),
-            # transforms.RandRotate90d(keys=[Keys.IMAGE, Keys.LABEL], prob=0.2, max_k=3),
+            transforms.RandRotate90d(keys=[Keys.IMAGE, Keys.LABEL], prob=0.2, max_k=3),
             transforms.RandScaleIntensityd(keys=Keys.IMAGE, factors=0.1, prob=0.1),
             transforms.RandShiftIntensityd(keys=Keys.IMAGE, offsets=0.1, prob=0.1),
-            # (
-            #     transforms.SaveImaged(
-            #         keys=[Keys.IMAGE, Keys.LABEL],
-            #         meta_keys=[f"{Keys.IMAGE}_meta_dict", f"{Keys.LABEL}_meta_dict"],
-            #         output_dir=os.path.join(
-            #             config.training.save_dir,
-            #             config.experiment.name.lower(),
-            #             "training_samples",
-            #         ),
-            #         output_postfix="",
-            #         separate_folder=False,
-            #         output_name_formatter=custom_name_formatter,
-            #     )
-            #     if DEBUG
-            #     else transforms.Identityd(keys=[Keys.IMAGE, Keys.LABEL])
-            # ),
-            transforms.AsDiscreted(
-                keys=[Keys.LABEL],
-                to_onehot=config.data.num_classes,
-            ),
             transforms.ToTensord(
                 keys=[Keys.IMAGE, Keys.LABEL],
             ),
@@ -424,12 +440,6 @@ def get_dataloaders(config, aim_logger, rank):
     )
     val_transform = transforms.Compose(
         [
-            # lambda data: (
-            #     logging.info(
-            #         f"Preprocess data"
-            #     ),
-            #     data,
-            # )[1],
             transforms.LoadImaged(keys=[Keys.IMAGE, Keys.LABEL]),
             transforms.EnsureChannelFirstd(keys=[Keys.IMAGE, Keys.LABEL]),
             transforms.Spacingd(
@@ -452,14 +462,6 @@ def get_dataloaders(config, aim_logger, rank):
             transforms.CropForegroundd(
                 keys=[Keys.IMAGE, Keys.LABEL], source_key=Keys.IMAGE
             ),
-            (
-                transforms.CropForegroundd(
-                    keys=[Keys.IMAGE, Keys.LABEL],
-                    source_key=Keys.LABEL,
-                )
-                if DEBUG
-                else transforms.Identityd(keys=[Keys.IMAGE, Keys.LABEL])
-            ),
             transforms.SpatialPadd(
                 keys=[Keys.IMAGE, Keys.LABEL],
                 spatial_size=config.data.roi_size,
@@ -472,22 +474,26 @@ def get_dataloaders(config, aim_logger, rank):
                     threshold_label, num_classes=config.data.num_classes
                 ),
             ),
-            # (
-            #     transforms.SaveImaged(
-            #         keys=[Keys.IMAGE, Keys.LABEL],
-            #         meta_keys=[f"{Keys.IMAGE}_meta_dict", f"{Keys.LABEL}_meta_dict"],
-            #         output_dir=os.path.join(
-            #             config.training.save_dir,
-            #             config.experiment.name.lower(),
-            #             "validation_samples",
-            #         ),
-            #         output_postfix="",
-            #         separate_folder=False,
-            #         output_name_formatter=custom_name_formatter,
-            #     )
-            #     if DEBUG
-            #     else transforms.Identityd(keys=[Keys.IMAGE, Keys.LABEL])
-            # ),
+            transforms.SaveImaged(
+                keys=[Keys.IMAGE],
+                output_dir=os.path.join(
+                    config.training.save_dir,
+                    config.experiment.name.lower(),
+                    "inference",
+                ),
+                output_postfix="image",
+                separate_folder=False,
+            ),
+            transforms.SaveImaged(
+                keys=[Keys.LABEL],
+                output_dir=os.path.join(
+                    config.training.save_dir,
+                    config.experiment.name.lower(),
+                    "inference",
+                ),
+                output_postfix="label",
+                separate_folder=False,
+            ),
             transforms.AsDiscreted(
                 keys=[Keys.LABEL],
                 to_onehot=config.data.num_classes,
@@ -527,6 +533,18 @@ def get_dataloaders(config, aim_logger, rank):
     return train_loader, val_loader
 
 
+def strip_module_prefix(state_dict):
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        # Remove redundant 'module.' prefix if it exists twice
+        if k.startswith("module.module."):
+            new_key = k.replace("module.module.", "module.", 1)
+        else:
+            new_key = k
+        new_state_dict[new_key] = v
+    return new_state_dict
+
+
 @profile_block("build_model")
 def build_model(config, rank):
     net = DiffUNet(
@@ -552,15 +570,12 @@ def build_model(config, rank):
     else:
         raise ValueError(f"Unsupported optimizer: {config.optimizer.name}")
 
-    lr_scheduler = None
     if config.lr_scheduler.name == "LinearWarmupCosineAnnealingLR":
         lr_scheduler = LinearWarmupCosineAnnealingLR(
             opt,
             warmup_epochs=config.lr_scheduler.warmup_epochs,
             max_epochs=config.lr_scheduler.max_epochs,
         )
-
-    scaler = GradScaler(enabled=config.amp.enabled)
 
     if rank == 0:
         num_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
@@ -580,27 +595,16 @@ def build_model(config, rank):
     if config.training.resume is not None:
         state_dict = torch.load(config.training.resume, map_location=f"cuda:{rank}")
 
-        net.load_state_dict(state_dict["network"], strict=False)
+        net.load_state_dict(strip_module_prefix(state_dict["network"]), strict=False)
         opt.load_state_dict(state_dict["optimizer"])
-        ema_model.load_state_dict(state_dict.get("ema_model", ema_model.state_dict()))
-        if "lr_scheduler" in state_dict:
-            lr_scheduler.load_state_dict(state_dict["lr_scheduler"])
-        else:
-            logging.warning(
-                f"[Rank {rank}] No lr_scheduler found in checkpoint, using default."
-            )
-
-        if "scaler" in state_dict:
-            scaler.load_state_dict(state_dict["scaler"])
-        else:
-            logging.warning(
-                f"[Rank {rank}] No scaler found in checkpoint, using default."
-            )
+        # ema_model.load_state_dict(state_dict.get("ema_model", ema_model.state_dict()))
+        ema_model.load_state_dict(
+            strip_module_prefix(state_dict.get("ema_model", ema_model.state_dict()))
+        )
 
         resume_epoch = str(config.training.resume).split(".")[0].split("_")[-1]
         if "epoch" in state_dict:
             resume_epoch = state_dict["epoch"]
-       
 
         if isinstance(resume_epoch, str):
             resume_epoch = int(resume_epoch)
@@ -616,7 +620,7 @@ def build_model(config, rank):
     # diffusion = segdiff.get_diffusion()
     # schedule_sampler = segdiff.get_schedule_sampler(config.diffusion.schedule_sampler.name, config.diffusion.schedule_sampler.max_steps)
 
-    return net, opt, lr_scheduler, ema_model, resume_epoch, scaler
+    return net, opt, lr_scheduler, ema_model, resume_epoch
 
 
 def prepare_batch(batch, device=None, non_blocking=True):
@@ -627,14 +631,23 @@ def prepare_batch(batch, device=None, non_blocking=True):
     return images, labels
 
 
+def get_metrics():
+    # create a dictionary of metrics
+    metrics = {
+        "Mean Dice": MeanDice(
+            include_background=False,
+            # to_onehot_y=True, softmax=True, batch=True
+        ),
+    }
+    return metrics
+
+
 # endregion
 
 # region Handlers
 
 
-def attach_checkpoint_handler(
-    trainer, val_evaluator, net, opt, lr_scheduler, scaler, ema_model, config, rank
-):
+def attach_checkpoint_handler(trainer, net, opt, ema_model, config, rank):
     if rank != 0:
         return
     try:
@@ -642,14 +655,13 @@ def attach_checkpoint_handler(
             config.training.save_dir, config.experiment.name.lower(), "checkpoints"
         )
 
-        best_metric_checkpoint_handler = ModelCheckpoint(
+        checkpoint_handler = ModelCheckpoint(
             dirname=ckpt_dir,
-            filename_prefix=f"{config.experiment.name}_best",
+            filename_prefix=config.experiment.name,
             n_saved=10,
-            score_name="Mean Dice",
             require_empty=False,
             create_dir=True,
-            global_step_transform=global_step_from_engine(trainer),
+            global_step_transform=lambda eng, _: eng.state.epoch,
             save_on_rank=0,
         )
         latest_ckpt = ModelCheckpoint(
@@ -658,18 +670,18 @@ def attach_checkpoint_handler(
             n_saved=1,
             require_empty=False,
             create_dir=True,
-            global_step_transform=global_step_from_engine(trainer),
+            global_step_transform=lambda eng, _: eng.state.epoch,
             save_on_rank=0,
         )
-        val_evaluator.add_event_handler(
-            Events.EPOCH_COMPLETED,
-            best_metric_checkpoint_handler,
-            {"network": net, "optimizer": opt, "ema_model": ema_model, "lr_scheduler": lr_scheduler, "scaler": scaler},
+        trainer.add_event_handler(
+            Events.EPOCH_COMPLETED(every=config.training.save_interval),
+            checkpoint_handler,
+            {"network": net, "optimizer": opt, "ema_model": ema_model},
         )
         trainer.add_event_handler(
             Events.EPOCH_COMPLETED(every=1),
             latest_ckpt,
-            {"network": net, "optimizer": opt, "ema_model": ema_model, "lr_scheduler": lr_scheduler, "scaler": scaler},
+            {"network": net, "optimizer": opt, "ema_model": ema_model},
         )
         logging.info(f"[Rank {rank}] Checkpoint handler attached successfully")
 
@@ -678,8 +690,17 @@ def attach_checkpoint_handler(
 
 
 def attach_ema_update(trainer, net, ema_model, config):
+    # def update_(engine):
+
+    #     # logging.info(f"[Rank {engine.state.rank}] Updating EMA parameters")
+
+    #     for p_ema, p in zip(ema_params, net.parameters()):
+    #         # update_ema(p_ema, p, rate=config.model.ema_rate)
+    #         p_ema.mul_(config.model.ema_rate).add_(p, alpha=1 - config.model.ema_rate)
+
     def update_ema(engine):
         ema_model.update_parameters(engine.network)  # updates the buffers
+        # logging.info(f"[EMA] updated at iter {engine.state.iteration}")
 
     trainer.add_event_handler(Events.ITERATION_COMPLETED(every=1), update_ema)
 
@@ -708,27 +729,20 @@ def attach_stats_handlers(trainer, val_evaluator, config, rank):
         return
 
     StatsHandler(
-        name="training_logger",
+        name="trainer",
         output_transform=from_engine(["loss"], first=True),
-        global_epoch_transform=lambda epoch : trainer.state.epoch,
         iteration_log=False,
-        tag_name="Dice Loss",
     ).attach(trainer)
-    
     StatsHandler(
-        name="training_logger",
+        name="evaluator",
         output_transform=lambda x: None,
-        global_epoch_transform=lambda epoch: trainer.state.epoch,
+        global_epoch_transform=lambda x: trainer.state.epoch,
         iteration_log=False,
-        tag_name="Dice Metric",
     ).attach(val_evaluator)
 
 
 def attach_early_stopping(val_evaluator, trainer, config, rank):
     if rank != 0:
-        return
-    if not config.evaluation.early_stopping.enabled:
-        logging.info(f"[Rank {rank}] Early stopping is disabled")
         return
     stopper = EarlyStopping(
         patience=config.evaluation.early_stopping.patience,
@@ -736,7 +750,6 @@ def attach_early_stopping(val_evaluator, trainer, config, rank):
         trainer=trainer,
     )
     val_evaluator.add_event_handler(Events.EPOCH_COMPLETED, stopper)
-    logging.info(f"[Rank {rank}] Early stopping attached")
 
 
 def attach_aim_handlers(
@@ -770,12 +783,12 @@ def attach_aim_handlers(
                 val_evaluator,
                 log_handler=AimIgnite3DImageHandler(
                     "Prediction",
-                    output_transform=from_engine([Keys.IMAGE, Keys.LABEL, Keys.PRED]),
+                    output_transform=from_engine(["image", "y", "y_pred"]),
                     global_step_transform=global_step_from_engine(trainer),
                     postprocess=postprocess,
                 ),
                 event_name=Events.ITERATION_COMPLETED(
-                    every=1 if DEBUG else config.evaluation.visualize_every_iter
+                    every=config.evaluation.visualize_every_iter
                 ),
             )
     except Exception as e:
@@ -787,8 +800,6 @@ def attach_handlers(
     val_evaluator,
     net,
     opt,
-    lr_scheduler,
-    scaler,
     ema_model,
     config,
     aim_logger,
@@ -802,13 +813,20 @@ def attach_handlers(
     if rank == 0:
         logging.info(f"[Rank {rank}] Attaching handlers")
 
-    attach_checkpoint_handler(trainer, val_evaluator, net, opt, lr_scheduler, scaler, ema_model, config, rank)
+    # Run the postprocess on the validation evaluator
+    val_evaluator.add_event_handler(
+        Events.ITERATION_COMPLETED(every=1),
+        lambda engine: postprocess(engine.state.output)
+    )
+    return 
+    
+    attach_checkpoint_handler(trainer, net, opt, ema_model, config, rank)
 
     attach_ema_update(trainer, net, ema_model, config)
     attach_ema_validation(trainer, net, ema_model, val_evaluator, val_loader, config)
 
     attach_stats_handlers(trainer, val_evaluator, config, rank)
-    attach_early_stopping(val_evaluator, trainer, config, rank)
+    # attach_early_stopping(val_evaluator, trainer, config, rank)
     attach_aim_handlers(
         trainer,
         val_evaluator,
@@ -847,7 +865,7 @@ def _distributed_run(rank, config):
 
     train_loader, val_loader = get_dataloaders(config, aim_logger, rank)
 
-    net, opt, lr_scheduler, ema_model, resume_epoch, scaler = build_model(config, rank)
+    net, opt, lr_scheduler, ema_model, resume_epoch = build_model(config, rank)
 
     trainer = Trainer(
         device=device,
@@ -855,7 +873,7 @@ def _distributed_run(rank, config):
         data_loader=train_loader,
         prepare_batch=prepare_batch,
         iteration_update=train_step,
-        # key_metric={'loss': None},           # or your dict of Metrics
+        # key_metric={'loss': None},             # or your dict of Metrics
         additional_metrics=None,
         metric_cmp_fn=default_metric_cmp_fn,
         amp=config.amp.enabled,
@@ -863,14 +881,13 @@ def _distributed_run(rank, config):
     trainer.network = net
     trainer.optimizer = opt
     trainer.lr_scheduler = lr_scheduler
-    trainer.scaler_ = scaler
+    trainer.scaler_ = GradScaler(enabled=config.amp.enabled)
     trainer.config = config
 
     trainer.ce = nn.CrossEntropyLoss()
     trainer.mse = nn.MSELoss()
     trainer.bce = nn.BCEWithLogitsLoss()
     trainer.dice_loss = DiceLoss(sigmoid=True)
-    # trainer.dice_loss = DiceLoss(softmax=True, to_onehot_y=True)
 
     trainer.optim_set_to_none = config.optimizer.set_to_none
 
@@ -879,29 +896,55 @@ def _distributed_run(rank, config):
     postprocess = transforms.Compose(
         [
             transforms.AsDiscreted(
-                keys=Keys.PRED,
-                argmax=True,
-                to_onehot=config.data.num_classes,
-                # keys=Keys.PRED, threshold=0.5
+                keys=Keys.PRED, argmax=True
             ),
+            transforms.SaveImaged(
+                keys=[Keys.PRED],
+                output_dir=os.path.join(
+                        config.training.save_dir,
+                        config.experiment.name.lower(),
+                        "inference",
+                    ),
+                    output_postfix="pred",
+                    separate_folder=False,
+        ),
+            
+            transforms.AsDiscreted(keys=Keys.LABEL, to_onehot=config.data.num_classes),
+        #     transforms.SaveImaged(
+        #         keys=["image",],
+        #         output_dir=os.path.join(
+        #                 config.training.save_dir,
+        #                 config.experiment.name.lower(),
+        #                 "inference",
+        #             ),
+        #             output_postfix="image",
+        #             separate_folder=False,
+        # ),
+        #     transforms.SaveImaged(
+        #         keys=["y",],
+        #         output_dir=os.path.join(
+        #                 config.training.save_dir,
+        #                 config.experiment.name.lower(),
+        #                 "inference",
+        #             ),
+        #             output_postfix="label",
+        #             separate_folder=False,
+        # ),
+        
         ]
     )
-    metrics = {
-        "Mean Dice": MeanDice(
-            include_background=False,
-            output_transform=from_engine([Keys.PRED, Keys.LABEL]),
-            num_classes=config.data.num_classes,
-        ),
-        # "Dummy Metric": lambda x: (logging.info(f"Dummy metric called with {x}"), 0.0)[1],
-    }
+
+    metrics = {"Mean Dice": MeanDice(include_background=False, output_transform=from_engine([Keys.PRED, Keys.LABEL]))}
+
     val_evaluator = Evaluator(
         device=device,
         val_data_loader=val_loader,
         prepare_batch=prepare_batch,
         iteration_update=eval_step,
         postprocessing=postprocess,
-        key_val_metric=metrics,
+        # key_val_metric=metrics,
     )
+
     # 4) Attach objects needed during eval
     val_evaluator.network = ema_model
     val_evaluator.config = config
@@ -909,20 +952,18 @@ def _distributed_run(rank, config):
         roi_size=config.data.roi_size, sw_batch_size=1, overlap=0.5
     )
 
-    attach_handlers(
-        trainer,
-        val_evaluator,
-        net,
-        opt,
-        lr_scheduler,
-        scaler,
-        ema_model,
-        config,
-        aim_logger,
-        val_loader,
-        rank,
-        postprocess=postprocess,
-    )
+    # attach_handlers(
+    #     trainer,
+    #     val_evaluator,
+    #     net,
+    #     opt,
+    #     ema_model,
+    #     config,
+    #     aim_logger,
+    #     val_loader,
+    #     rank,
+    #     postprocess=postprocess,
+    # )
     # Add barrier to ensure all processes are ready before starting training
     idist.utils.barrier()
 
@@ -937,14 +978,12 @@ def _distributed_run(rank, config):
             f"[Rank {rank}] Validation on {len(val_loader.dataset)} validation samples"
         )
 
-    
-    with TorchProfiler(subdir="trainer_run"):
-        trainer.state.epoch = resume_epoch
-        if resume_epoch > 0:
-            logging.info(f"[Rank {rank}] Resuming training from epoch {resume_epoch}")
-       
-        val_evaluator.run() # Run validation before starting training
-        trainer.run()
+    val_evaluator.run()
+    # with TorchProfiler(subdir="trainer_run"):
+    #     trainer.state.epoch = resume_epoch
+    #     if resume_epoch > 0:
+    #         logging.info(f"[Rank {rank}] Resuming training from epoch {resume_epoch}")
+    #     trainer.run()
 
 
 if __name__ == "__main__":
@@ -956,12 +995,7 @@ if __name__ == "__main__":
 
     if DEBUG:
         config.experiment.name = f"debug_{config.experiment.name}"
-        config.training.save_dir = os.path.join(
-            config.training.save_dir, "debug"
-        )
         config.evaluation.validation_interval = 1
-        config.experiment.tags.append("debug")
-        config.training.resume = None  # Don't resume from any previous run
 
         logging.info(
             f""" {'-'* 50}

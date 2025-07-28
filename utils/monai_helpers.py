@@ -96,6 +96,11 @@ class AimIgnite3DImageHandler:
 
     def __call__(self, engine, logger, event_name):
 
+        if self.global_step_transform is not None:
+            global_step = self.global_step_transform(engine, Events.EPOCH_COMPLETED)
+        else:
+            global_step = engine.state.get_event_attrib_value(event_name)
+
         if self.output_transform is not None:
             img, label, pred = self.output_transform(engine.state.output)
             img = img[0]  # Assuming batch size of 1
@@ -113,39 +118,47 @@ class AimIgnite3DImageHandler:
         if self.plot_once and tag_name in AimIgnite3DImageHandler.plotted_tags:
             return
 
-        
         # if len(img.shape) == 5 or len(img.shape) == 4:
         img = img.squeeze()
         label = label.squeeze()
         pred = pred.squeeze()
-        
-        label = torch.argmax(label, dim=0, keepdim=False)
-        pred = torch.argmax(pred, dim=0, keepdim=False)
+
+        if self.log_unique_values:
+            unique_values = torch.unique(pred).cpu()
+            logger.experiment.log_info(
+                f"""Epoch: {global_step},
+                Prediction Unique values for {self.tag}: {unique_values}
+                Prediction Shape after squeeze: {pred.shape}"""
+            )
+
+        if len(label.shape) > 3:
+            label = torch.argmax(label, dim=0, keepdim=False)
+        if len(pred.shape) > 3:
+            pred = torch.argmax(pred, dim=0, keepdim=False)
 
         assert len(img.shape) == 3, f"Image shape {img.shape} is not 3D. Expected 3D images for visualizations."
         assert len(label.shape) == 3, f"Label shape {label.shape} is not 3D. Expected 3D labels for visualizations."
         assert len(pred.shape) == 3, f"Prediction shape {pred.shape} is not 3D. Expected 3D predictions for visualizations."
-        
+
         img_data = img.cpu().numpy()
         label_data = label.cpu().numpy()
         pred_data = pred.cpu().numpy()
-        
-        
+
         # Get the slice with maximum volume in label data
         # if label_data.ndim == 3:
-        
+
         max_slice_index = np.argmax(np.sum(label_data > 0, axis=(0, 1)))
         img_data = img_data[:,:,max_slice_index]
         label_data = label_data[:,:,max_slice_index]
         pred_data = pred_data[:,:,max_slice_index]
 
         tag_name = f"{self.tag} {img_name} slice {max_slice_index}"
-        
+
         fig = plot_image_label_pred(
             img_name, img_data, label_data, pred_data)
         # volume = np.sum(img_data[img_data > 0]) / 1000
         # label_volume = np.sum(label_data[label_data > 0]) / 1000
-        
+
         # unique_values = torch.unique(img).cpu()
 
         # fig = get_big_fig(
@@ -167,22 +180,8 @@ class AimIgnite3DImageHandler:
         #     n_every=5,
         # )
 
-        if self.global_step_transform is not None:
-            global_step = self.global_step_transform(engine, Events.EPOCH_COMPLETED)
-        else:
-            global_step = engine.state.get_event_attrib_value(event_name)
-
         logger.experiment.track(Image(fig), name=tag_name, step=global_step)
-
-        if self.log_unique_values:
-            unique_values = torch.unique(img).cpu()
-            if not AimIgnite3DImageHandler.last_printed_unique_values.equal(
-                unique_values
-            ):
-                logger.experiment.log_info(
-                    f"""Epoch: {global_step},
-                    Unique values for {self.tag}: {unique_values}"""
-                )
+        plt.close(fig)
 
         AimIgnite3DImageHandler.plotted_tags.add(tag_name)
 
@@ -255,6 +254,7 @@ class AimIgnite2DImageHandler:
             logging.info(f"Visualizing {img_name} at step {global_step}")
 
             logger.experiment.track(Image(fig), name=tag_name, step=global_step)
+            plt.close(fig)
             AimIgnite2DImageHandler.plotted_tags.add(tag_name)
 
 

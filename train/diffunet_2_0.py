@@ -1,18 +1,15 @@
-import os
-import sys
-import logging
+import os, sys, logging
 import json
-import copy
-import monai.transforms
 import numpy as np
 import argparse
 import functools
-import nibabel
+
 
 from typing import Iterable, Callable, Any, Sequence
 import aim
 from aim.pytorch_ignite import AimLogger
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, DictConfig
+import hydra
 
 import torch
 import torch.nn as nn
@@ -64,42 +61,6 @@ import torch.multiprocessing as tmp_mp
 
 tmp_mp.set_sharing_strategy("file_system")
 
-DEBUG = False
-# region utils (EMA update, get_args, update_ema)
-def get_args():
-    parser = argparse.ArgumentParser(description="Training script")
-
-    parser.add_argument(
-        "--base_config",
-        type=str,
-        default="/home/yb107/cvpr2025/DukeDiffSeg/configs/base.yaml",
-        help="Path to base config file (default: configs/base.yaml)",
-    )
-
-    parser.add_argument(
-        "--exp_config",
-        type=str,
-        required=True,
-        help="Path to experiment config file that overrides base",
-    )
-
-    args = parser.parse_args()
-
-    # Load and merge configs
-    base_cfg = OmegaConf.load(args.base_config)
-    exp_cfg = OmegaConf.load(args.exp_config)
-    config = OmegaConf.merge(base_cfg, exp_cfg)
-
-    setup_logger(
-        name="training_logger",  # this is the logger that StatsHandler will use
-        level=logging.INFO,
-        stream=sys.stdout,
-        format="%(asctime)s %(levelname)s: %(message)s",
-        reset=True,  # drop any old handlers on this logger
-    )
-    return config
-
-# endregion
 
 # region train_step and eval_step:
 def train_step(engine, batchdata):
@@ -115,6 +76,18 @@ def train_step(engine, batchdata):
     )
     images = images.float()
     labels = labels.float()
+
+    if config.experiment.debug and engine.state.rank == 0:
+
+        logging.debug(
+            f""" 
+            Train Epoch: {engine.state.epoch}, Iteration: {engine.state.iteration}, 
+            Images shape: {images.shape}, Labels shape: {labels.shape}, 
+            Batch size: {images.shape[0]}, Device: {engine.state.device} 
+            Unique labels: {torch.unique(labels).tolist()}
+            Image Unique values: {torch.unique(images).tolist()}
+            """    
+        )
     # labels_int = labels.long().squeeze(1)  # Assuming labels are in shape [B, 1, D, H, W]
 
     # labels_1hot = (
@@ -160,13 +133,13 @@ def train_step(engine, batchdata):
             scaler.update()
         else:
             optimizer.step()
-            
+
         for name, param in engine.network.named_parameters():
             if param.grad is None:
                 logging.warning(
                     f"Parameter {name} has no gradient. This may indicate an issue with the model or data."
                 )
-                
+
         optimizer.zero_grad(set_to_none=engine.optim_set_to_none)
 
     engine.fire_event(IterationEvents.MODEL_COMPLETED)
@@ -201,7 +174,7 @@ def eval_step(engine, batchdata):
     # engine.state.output[Keys.PRED] = (engine.state.output[Keys.PRED] + 1) / 2.0
     engine.state.output[Keys.PRED] = torch.sigmoid(engine.state.output[Keys.PRED])
 
-    if DEBUG:
+    if config.experiment.debug:
         raw_logits = engine.state.output[Keys.PRED]
         logging.info(
             f"Logits stats: min={raw_logits.min():.4f}, max={raw_logits.max():.4f}, mean={raw_logits.mean():.4f}"
@@ -220,9 +193,8 @@ def eval_step(engine, batchdata):
 
 # endregion
 
+
 # region Logging and Config Handling :
-
-
 def log_config(config, rank):
     if rank == 0:
         logging.info(f"Config: \n{OmegaConf.to_yaml(config)}")
@@ -264,72 +236,233 @@ def get_aim_logger(config):
 
 # endregion
 
+
 # region Data Loading and Preprocessing
 
 
-def threshold_label(x: torch.Tensor, num_classes: int) -> torch.Tensor:
-    """Remove values greater than num_classes from the label tensor."""
-    x[x >= num_classes] = 0
+def binary_mask_labels(x: torch.Tensor, labels: list) -> torch.Tensor:
+    """Create a binary mask for the specified labels in the label tensor."""
+    # get max label + 1
+    tmp_lbl = x.max() + 1
+    for label in labels:
+        x[x == label] = tmp_lbl
+    x[x != tmp_lbl] = 0
+    x[x == tmp_lbl] = 1
+    return x
+
+def remove_labels(x: torch.Tensor, labels: list) -> torch.Tensor:
+    """Remove the specified labels from the label tensor."""
+    for label in labels:
+        x[x == label] = 0
+    return x
+
+def transform_labels(x: torch.Tensor, label_map: dict) -> torch.Tensor:
+    """Transform labels in the tensor according to the provided label_map."""
+    for old_label, new_label in label_map.items():
+        x[x == old_label] = new_label
     return x
 
 
-def mask_label(x: torch.Tensor, label: int) -> torch.Tensor:
-    """Mask out the specified label in the label tensor."""
-    x[x != label] = 0
-    x[x == label] = 1
-    return x
-
-
-def custom_name_formatter(meta_dict, saver):
-    full_path = meta_dict["filename_or_obj"]
-    base = os.path.basename(full_path)
-    # If the filename itself contains "colon", pull the parent folder as the ID
-
-    if "labels" in full_path.lower():
-        postfix = "_label"
-    else:
-        # strip off ".nii.gz" (7 chars) or any extension
-        postfix = "_image"
-    # saver.file_postfix is either "_image" or "_label"
-    return {"filename": f"{base.replace('.nii.gz', '')}{postfix}"}
-
-
-@profile_block("get_dataloaders")
-def get_dataloaders(config, aim_logger, rank):
-    train_files = []
-    val_files = []
-
-    with open(config.data.train_jsonl, "r") as f:
+def list_from_jsonl(jsonl_path, image_key="image", label_key="label"):
+    """Pure function: read a .jsonl and return a list of dicts for MONAI."""
+    files = []
+    with open(jsonl_path, "r") as f:
         for line in f:
-            data = json.loads(line)
-            train_files.append(
-                {
-                    Keys.IMAGE: data["image"],
-                    Keys.LABEL: data["mask"],
-                }
-            )
+            d = json.loads(line)
+            files.append({Keys.IMAGE: d[image_key], Keys.LABEL: d[label_key]})
+    return files
 
-    with open(config.data.val_jsonl, "r") as f:
-        for line in f:
-            data = json.loads(line)
-            val_files.append(
-                {
-                    Keys.IMAGE: data["image"],
-                    Keys.LABEL: data["mask"],
-                }
-            )
+def get_transforms(config, train=True):
+    """Get the MONAI transforms for training or validation."""
+    
+    def custom_name_formatter(meta_dict, saver):
+        full_path = meta_dict["filename_or_obj"]
+        base = os.path.basename(full_path)
+        # If the filename itself contains "colon", pull the parent folder as the ID
 
-    if rank == 0:
+        if "labels" in full_path.lower():
+            postfix = "_label"
+        else:
+            postfix = "_image"
+
+        return {"filename": f"{base.replace('.nii.gz', '')}"}
+
+
+    custom_transforms = [
+        transforms.LoadImaged(keys=[Keys.IMAGE, Keys.LABEL]),
+        transforms.EnsureChannelFirstd(keys=[Keys.IMAGE, Keys.LABEL]),
+        transforms.Spacingd(
+            keys=[Keys.IMAGE, Keys.LABEL],
+            pixdim=config.data.pixdim,
+            mode=["nearest", "nearest"],
+        ),
+        transforms.Orientationd(
+            keys=[Keys.IMAGE, Keys.LABEL],
+            axcodes=config.data.orientation,
+        ),
+        transforms.CropForegroundd(
+            keys=[Keys.IMAGE, Keys.LABEL], source_key=Keys.IMAGE
+        ),
+        transforms.SpatialPadd(
+            keys=[Keys.IMAGE, Keys.LABEL],
+            spatial_size=config.data.roi_size,
+            mode=["constant", "constant"],
+            constant_values=[0, 0],
+        ),
+        transforms.Lambdad(
+                keys=[Keys.IMAGE, Keys.LABEL],
+                func=functools.partial(
+                    transform_labels,
+                    label_map={
+                        14: 13,
+                        15: 13,
+                        16: 13,
+                        17: 13,
+                        18: 13,
+                        19: 13,
+                        20: 13,
+                        21: 13,
+                        22: 13,
+                    },
+                ),
+            ),
+            transforms.Lambdad(
+                keys=[Keys.LABEL],
+                func=functools.partial(
+                    remove_labels,
+                    labels=range(4, 14),  # Assuming labels 4-13 are the organs,
+                ),
+            ),
+    ]
+    
+    if train:
+        custom_transforms.append(
+            transforms.RandCropByPosNegLabeld(
+                keys=[Keys.IMAGE, Keys.LABEL],
+                label_key=Keys.LABEL,
+                spatial_size=(96, 96, 96),
+                pos=5,
+                neg=1,
+                num_samples=4 if not config.experiment.debug else 1,
+                image_key=Keys.IMAGE,
+                image_threshold=0,
+            )
+        )
+    
+    if config.task.target == "colon_bowel":
+        # Remove rectum (2) and transform small bowel (3) to rectum (2)
+        custom_transforms.append(
+            transforms.Lambdad(
+                keys=[Keys.LABEL],
+                func=functools.partial(
+                    remove_labels,
+                    labels=[2],
+                ),
+            ),
+        )
+        custom_transforms.append(
+            transforms.Lambdad(
+                keys=[Keys.LABEL],
+                func=functools.partial(transform_labels, label_map={3: 2}),
+            ),
+        )
+        custom_transforms.append(
+            transforms.Lambdad(
+                keys=[Keys.IMAGE],
+                func=functools.partial(transform_labels, label_map={1: 0, 3: 0}), # Remove colon and small bowel from Image
+            ),
+        )
+    elif config.task.target == "colon":
+        # Remove rectum (2) and small bowel (3)
+        custom_transforms.append(
+            transforms.Lambdad(
+                keys=[Keys.LABEL],
+                func=functools.partial(remove_labels, labels=[2, 3]),
+            ),
+        )
+        custom_transforms.append(
+            transforms.Lambdad(
+                keys=[Keys.IMAGE],
+                func=functools.partial(transform_labels, label_map={1: 0}), # Remove colon and small bowel from Image
+            ),
+        )
+    
+    if config.constraint.target == "binary":
+        custom_transforms.append(
+            transforms.Lambdad(
+                keys=[Keys.IMAGE],
+                func=functools.partial(
+                    binary_mask_labels,
+                    labels=range(1, 14),  # Assuming labels 1-13 are the organs,
+                ),
+            ),
+        )
+
+    if config.experiment.debug and config.data.debug_save_data:
+        custom_transforms.append(
+            transforms.SaveImaged(
+                keys=[Keys.IMAGE],
+                meta_keys=[f"{Keys.IMAGE}_meta_dict"],
+                output_dir=os.path.join(
+                    config.training.save_dir,
+                    config.experiment.name.lower(),
+                    "training_samples" if train else "validation_samples",
+                ),
+                output_postfix="image",
+                separate_folder=False,
+                output_name_formatter=custom_name_formatter,
+            )
+        )
+        custom_transforms.append(
+            transforms.SaveImaged(
+                keys=[Keys.LABEL],
+                meta_keys=[f"{Keys.LABEL}_meta_dict"],
+                output_dir=os.path.join(
+                    config.training.save_dir,
+                    config.experiment.name.lower(),
+                    "training_samples" if train else "validation_samples",
+                ),
+                output_postfix="label",
+                separate_folder=False,
+                output_name_formatter=custom_name_formatter,
+            )
+        )
+
+    custom_transforms.extend([
+        transforms.AsDiscreted(
+                keys=[Keys.IMAGE, Keys.LABEL],
+                to_onehot=[
+                    config.model.params.in_channels,
+                    config.model.params.out_channels,
+                ],
+            ),
+            transforms.ToTensord(
+                keys=[Keys.IMAGE, Keys.LABEL],
+            ),
+    ])
+    return transforms.Compose(custom_transforms)
+
+
+# @profile_block("get_dataloaders")
+def get_dataloaders(config, aim_logger):
+    train_files = list_from_jsonl(config.data.train_jsonl, image_key="mask", label_key="mask")
+    val_files = list_from_jsonl(config.data.val_jsonl, image_key="mask", label_key="mask")
+
+    if aim_logger is not None:
         aim_logger.experiment.track(
-            aim.Text(f"{json.dumps(train_files, indent=2)}"), name="Training Files", step=1
+            aim.Text(f"{json.dumps(train_files, indent=2)}"),
+            name="Training Files",
+            step=1,
         )
         logging.info(f"Training files length: {len(train_files)}")
         aim_logger.experiment.track(
-            aim.Text(f"{json.dumps(val_files, indent=2)}"), name="Validation Files", step=1
+            aim.Text(f"{json.dumps(val_files, indent=2)}"),
+            name="Validation Files",
+            step=1,
         )
         logging.info(f"Validation files length: {len(val_files)}")
 
-    if DEBUG:
+    if config.experiment.debug:
         train_files = train_files[:12]
         val_files = val_files[:4]
 
@@ -341,190 +474,70 @@ def get_dataloaders(config, aim_logger, rank):
         val_files = val_files[: config.evaluation.validation_max_num_samples]
         logging.info(f"Validation files length after sampling: {len(val_files)}")
 
-    # TODO: Crop foreground for training and validation abdomenal region
-    # TODO: Train seperate model using different Data.jsonl
-    # TODO: Predict 14 classes and only colon on new data
-
-    train_transform = transforms.Compose(
-        [
-            transforms.LoadImaged(keys=[Keys.IMAGE, Keys.LABEL]),
-            transforms.EnsureChannelFirstd(keys=[Keys.IMAGE, Keys.LABEL]),
-            transforms.Spacingd(
-                keys=[Keys.IMAGE, Keys.LABEL],
-                pixdim=config.data.pixdim,
-                mode=["bilinear", "nearest"],
-            ),
-            transforms.Orientationd(
-                keys=[Keys.IMAGE, Keys.LABEL],
-                axcodes=config.data.orientation,
-            ),
-            transforms.ScaleIntensityRanged(
-                keys=[Keys.IMAGE],
-                a_min=-175,
-                a_max=250.0,
-                b_min=0,
-                b_max=1.0,
-                clip=True,
-            ),
-            transforms.CropForegroundd(
-                keys=[Keys.IMAGE, Keys.LABEL], source_key=Keys.IMAGE
-            ),
-            transforms.SpatialPadd(
-                keys=[Keys.IMAGE, Keys.LABEL],
-                spatial_size=config.data.roi_size,
-                mode=["constant", "constant"],
-                constant_values=[0, 0],
-            ),
-            transforms.Lambdad(
-                keys=[Keys.LABEL],
-                func=functools.partial(
-                    threshold_label, num_classes=config.data.num_classes
-                ),
-            ),
-            transforms.RandCropByPosNegLabeld(
-                keys=[Keys.IMAGE, Keys.LABEL],
-                label_key=Keys.LABEL,
-                spatial_size=(96, 96, 96),
-                pos=5,
-                neg=1,
-                num_samples=4 if not DEBUG else 1,
-                image_key=Keys.IMAGE,
-                image_threshold=0,
-            ),
-            # transforms.RandFlipd(keys=[Keys.IMAGE, Keys.LABEL], prob=0.2, spatial_axis=0),
-            # transforms.RandFlipd(keys=[Keys.IMAGE, Keys.LABEL], prob=0.2, spatial_axis=1),
-            # transforms.RandFlipd(keys=[Keys.IMAGE, Keys.LABEL], prob=0.2, spatial_axis=2),
-            # transforms.RandRotate90d(keys=[Keys.IMAGE, Keys.LABEL], prob=0.2, max_k=3),
-            transforms.RandScaleIntensityd(keys=Keys.IMAGE, factors=0.1, prob=0.1),
-            transforms.RandShiftIntensityd(keys=Keys.IMAGE, offsets=0.1, prob=0.1),
-            # (
-            #     transforms.SaveImaged(
-            #         keys=[Keys.IMAGE, Keys.LABEL],
-            #         meta_keys=[f"{Keys.IMAGE}_meta_dict", f"{Keys.LABEL}_meta_dict"],
-            #         output_dir=os.path.join(
-            #             config.training.save_dir,
-            #             config.experiment.name.lower(),
-            #             "training_samples",
-            #         ),
-            #         output_postfix="",
-            #         separate_folder=False,
-            #         output_name_formatter=custom_name_formatter,
-            #     )
-            #     if DEBUG
-            #     else transforms.Identityd(keys=[Keys.IMAGE, Keys.LABEL])
-            # ),
-            transforms.AsDiscreted(
-                keys=[Keys.LABEL],
-                to_onehot=config.data.num_classes,
-            ),
-            transforms.ToTensord(
-                keys=[Keys.IMAGE, Keys.LABEL],
-            ),
-        ]
-    )
-    val_transform = transforms.Compose(
-        [
-            # lambda data: (
-            #     logging.info(
-            #         f"Preprocess data"
-            #     ),
-            #     data,
-            # )[1],
-            transforms.LoadImaged(keys=[Keys.IMAGE, Keys.LABEL]),
-            transforms.EnsureChannelFirstd(keys=[Keys.IMAGE, Keys.LABEL]),
-            transforms.Spacingd(
-                keys=[Keys.IMAGE, Keys.LABEL],
-                pixdim=config.data.pixdim,
-                mode=["bilinear", "nearest"],
-            ),
-            transforms.Orientationd(
-                keys=[Keys.IMAGE, Keys.LABEL],
-                axcodes=config.data.orientation,
-            ),
-            transforms.ScaleIntensityRanged(
-                keys=[Keys.IMAGE],
-                a_min=-175,
-                a_max=250.0,
-                b_min=0,
-                b_max=1.0,
-                clip=True,
-            ),
-            transforms.CropForegroundd(
-                keys=[Keys.IMAGE, Keys.LABEL], source_key=Keys.IMAGE
-            ),
-            (
-                transforms.CropForegroundd(
-                    keys=[Keys.IMAGE, Keys.LABEL],
-                    source_key=Keys.LABEL,
-                )
-                if DEBUG
-                else transforms.Identityd(keys=[Keys.IMAGE, Keys.LABEL])
-            ),
-            transforms.SpatialPadd(
-                keys=[Keys.IMAGE, Keys.LABEL],
-                spatial_size=config.data.roi_size,
-                mode=["constant", "constant"],
-                constant_values=[0, 0],
-            ),
-            transforms.Lambdad(
-                keys=[Keys.LABEL],
-                func=functools.partial(
-                    threshold_label, num_classes=config.data.num_classes
-                ),
-            ),
-            # (
-            #     transforms.SaveImaged(
-            #         keys=[Keys.IMAGE, Keys.LABEL],
-            #         meta_keys=[f"{Keys.IMAGE}_meta_dict", f"{Keys.LABEL}_meta_dict"],
-            #         output_dir=os.path.join(
-            #             config.training.save_dir,
-            #             config.experiment.name.lower(),
-            #             "validation_samples",
-            #         ),
-            #         output_postfix="",
-            #         separate_folder=False,
-            #         output_name_formatter=custom_name_formatter,
-            #     )
-            #     if DEBUG
-            #     else transforms.Identityd(keys=[Keys.IMAGE, Keys.LABEL])
-            # ),
-            transforms.AsDiscreted(
-                keys=[Keys.LABEL],
-                to_onehot=config.data.num_classes,
-            ),
-            transforms.ToTensord(keys=[Keys.IMAGE, Keys.LABEL]),
-        ]
-    )
     # create a training data loader
-    train_ds = monai.data.PersistentDataset(
-        data=train_files,
-        transform=train_transform,
-        cache_dir=config.data.cache_dir,
-    )
-    train_loader = auto_dataloader(
-        train_ds,
-        batch_size=config.data.batch_size,
-        num_workers=config.data.num_workers,
-        collate_fn=list_data_collate,
-        pin_memory=torch.cuda.is_available(),
-        persistent_workers=True,
-        shuffle=True,
-    )
-    # create a validation data loader
-    val_ds = monai.data.PersistentDataset(
-        data=val_files,
-        transform=val_transform,
-        cache_dir=config.data.cache_dir,
-    )
-    val_loader = auto_dataloader(
-        val_ds,
-        batch_size=config.data.val_batch_size,
-        num_workers=config.data.val_num_workers,
-        collate_fn=list_data_collate,
-        pin_memory=torch.cuda.is_available(),
-        persistent_workers=True,
-    )
+    if config.data.cache_dir is not None:
+        # train_ds = monai.data.PersistentDataset(
+        train_ds = monai.data.CacheNTransDataset(
+            data=train_files,
+            transform=get_transforms(config, train=True),
+            cache_dir=config.data.cache_dir,
+            cache_n_trans=8
+        )
+        train_loader = auto_dataloader(
+            train_ds,
+            batch_size=config.data.batch_size_per_gpu * config.training.num_gpus,
+            num_workers=config.data.num_workers_per_gpu * config.training.num_gpus,
+            collate_fn=list_data_collate,
+            pin_memory=torch.cuda.is_available(),
+            persistent_workers=True,
+            shuffle=config.data.shuffle_train_data,
+        )
+        # create a validation data loader
+        val_ds = monai.data.CacheNTransDataset(
+            data=val_files,
+            transform=get_transforms(config, train=False),
+            cache_dir=config.data.cache_dir,
+            cache_n_trans=8
+        )
+        val_loader = auto_dataloader(
+            val_ds,
+            batch_size=config.data.val_batch_size,
+            num_workers=config.data.val_num_workers,
+            collate_fn=list_data_collate,
+            pin_memory=torch.cuda.is_available(),
+            persistent_workers=True,
+        )
+    else:
+        train_ds = monai.data.Dataset(
+            data=train_files, transform=get_transforms(config, train=True)
+        )
+        train_loader = monai.data.DataLoader(
+            train_ds,
+            batch_size=config.data.batch_size_per_gpu * config.training.num_gpus,
+            num_workers=config.data.num_workers_per_gpu * config.training.num_gpus,
+            collate_fn=list_data_collate,
+            pin_memory=torch.cuda.is_available(),
+            persistent_workers=True,
+            shuffle=config.data.shuffle_train_data,
+        )
+        # create a validation data loader
+        val_ds = monai.data.Dataset(
+            data=val_files, transform=get_transforms(config, train=False)
+        )
+        val_loader = monai.data.DataLoader(
+            val_ds,
+            batch_size=config.data.val_batch_size,
+            num_workers=config.data.val_num_workers,
+            collate_fn=list_data_collate,
+            pin_memory=torch.cuda.is_available(),
+            persistent_workers=True,
+        )
     return train_loader, val_loader
+
+
+# endregion
+
+# region Model Building
 
 
 @profile_block("build_model")
@@ -600,7 +613,6 @@ def build_model(config, rank):
         resume_epoch = str(config.training.resume).split(".")[0].split("_")[-1]
         if "epoch" in state_dict:
             resume_epoch = state_dict["epoch"]
-       
 
         if isinstance(resume_epoch, str):
             resume_epoch = int(resume_epoch)
@@ -664,12 +676,24 @@ def attach_checkpoint_handler(
         val_evaluator.add_event_handler(
             Events.EPOCH_COMPLETED,
             best_metric_checkpoint_handler,
-            {"network": net, "optimizer": opt, "ema_model": ema_model, "lr_scheduler": lr_scheduler, "scaler": scaler},
+            {
+                "network": net,
+                "optimizer": opt,
+                "ema_model": ema_model,
+                "lr_scheduler": lr_scheduler,
+                "scaler": scaler,
+            },
         )
         trainer.add_event_handler(
             Events.EPOCH_COMPLETED(every=1),
             latest_ckpt,
-            {"network": net, "optimizer": opt, "ema_model": ema_model, "lr_scheduler": lr_scheduler, "scaler": scaler},
+            {
+                "network": net,
+                "optimizer": opt,
+                "ema_model": ema_model,
+                "lr_scheduler": lr_scheduler,
+                "scaler": scaler,
+            },
         )
         logging.info(f"[Rank {rank}] Checkpoint handler attached successfully")
 
@@ -710,11 +734,11 @@ def attach_stats_handlers(trainer, val_evaluator, config, rank):
     StatsHandler(
         name="training_logger",
         output_transform=from_engine(["loss"], first=True),
-        global_epoch_transform=lambda epoch : trainer.state.epoch,
+        global_epoch_transform=lambda epoch: trainer.state.epoch,
         iteration_log=False,
         tag_name="Dice Loss",
     ).attach(trainer)
-    
+
     StatsHandler(
         name="training_logger",
         output_transform=lambda x: None,
@@ -775,7 +799,7 @@ def attach_aim_handlers(
                     postprocess=postprocess,
                 ),
                 event_name=Events.ITERATION_COMPLETED(
-                    every=1 if DEBUG else config.evaluation.visualize_every_iter
+                    every=1 if config.experiment.debug else config.evaluation.visualize_every_iter
                 ),
             )
     except Exception as e:
@@ -802,7 +826,9 @@ def attach_handlers(
     if rank == 0:
         logging.info(f"[Rank {rank}] Attaching handlers")
 
-    attach_checkpoint_handler(trainer, val_evaluator, net, opt, lr_scheduler, scaler, ema_model, config, rank)
+    attach_checkpoint_handler(
+        trainer, val_evaluator, net, opt, lr_scheduler, scaler, ema_model, config, rank
+    )
 
     attach_ema_update(trainer, net, ema_model, config)
     attach_ema_validation(trainer, net, ema_model, val_evaluator, val_loader, config)
@@ -937,31 +963,31 @@ def _distributed_run(rank, config):
             f"[Rank {rank}] Validation on {len(val_loader.dataset)} validation samples"
         )
 
-    
     with TorchProfiler(subdir="trainer_run"):
         trainer.state.epoch = resume_epoch
         if resume_epoch > 0:
             logging.info(f"[Rank {rank}] Resuming training from epoch {resume_epoch}")
-       
-        val_evaluator.run() # Run validation before starting training
+
+        val_evaluator.run()  # Run validation before starting training
         trainer.run()
 
 
-if __name__ == "__main__":
-    config = get_args()
-    # world_size = torch.cuda.device_count()
-    # rank = int(os.environ["LOCAL_RANK"])  # torchrun provides this env var
-    # logging.info(f"Running on rank {rank} with world size {world_size}")
-    # main(rank, world_size)
+def derive_experiment_metadata(cfg: DictConfig) -> None:
+    parts = [cfg.experiment.name, str(cfg.experiment.version), cfg.constraint.target, cfg.task.target]
 
-    if DEBUG:
-        config.experiment.name = f"debug_{config.experiment.name}"
-        config.training.save_dir = os.path.join(
-            config.training.save_dir, "debug"
-        )
-        config.evaluation.validation_interval = 1
-        config.experiment.tags.append("debug")
-        config.training.resume = None  # Don't resume from any previous run
+    if cfg.loss.type != "default":
+        parts.append(cfg.loss.type)
+
+    cfg.experiment.name = "-".join(parts)
+    # drop the version itself, leave tags for Aim
+    cfg.experiment.tags.extend(parts[2:])
+
+    if cfg.experiment.debug:
+        cfg.experiment.name = f"debug_{cfg.experiment.name}"
+        cfg.training.save_dir = os.path.join(cfg.training.save_dir, "debug")
+        cfg.evaluation.validation_interval = 1
+        cfg.experiment.tags.append("debug")
+        cfg.training.resume = None  # Don't resume from any previous run
 
         logging.info(
             f""" {'-'* 50}
@@ -972,7 +998,33 @@ if __name__ == "__main__":
                      """
         )
 
+
+@hydra.main(
+    config_path="/home/yb107/cvpr2025/DukeDiffSeg/configs/diffunet_v2",
+    config_name="config",
+)
+def main(cfg: DictConfig):
+    # initialize standard python logger
+    setup_logger(
+        name="training_logger",
+        level=logging.INFO,
+        stream=sys.stdout,
+        format="%(asctime)s %(levelname)s: %(message)s",
+        reset=True,
+    )
+
+    # derive version & tags
+    derive_experiment_metadata(cfg)
+
+    # # log merged config for debug
+    # logging.info("Merged config:\n" + OmegaConf.to_yaml(cfg))
+
+    # now launch all ranks, passing only cfg
     with idist.Parallel(
         backend="nccl", nproc_per_node=torch.cuda.device_count()
     ) as parallel:
-        parallel.run(_distributed_run, config)
+        parallel.run(_distributed_run, cfg)
+
+
+if __name__ == "__main__":
+    main()

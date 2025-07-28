@@ -1,0 +1,5 @@
+target: multi_class
+
+model:
+  params:
+    in_channels: "${data.num_classes}"

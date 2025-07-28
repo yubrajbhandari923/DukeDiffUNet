@@ -1,0 +1,5 @@
+constraint: multi_class_sdf
+
+model:
+  params:
+    in_channels: "${data.num_classes}"

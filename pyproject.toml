@@ -1,0 +1,44 @@
+# pyproject.toml
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dukediffseg"
+version = "0.1.0"
+dependencies = [
+  "torch",
+  "monai",
+  "ignite",
+  "aim",
+  "omegaconf",
+  "nibabel",
+  "batchgenerators",
+  "torchvision",
+    "kornia",
+    
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=6.0",
+  "hydra-core>=1.1",
+  "pytest-cov"
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = [
+  "train*",
+  "model*",
+  "utils*"
+]
+exclude = [
+  "configs*",
+  "tests*",
+  "notebook*",
+  "outputs*",
+  "results*",
+  "data*",
+  "inference*"
+]

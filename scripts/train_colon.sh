@@ -1,8 +1,8 @@
 #!/bin/bash
 cd /home/yb107/cvpr2025/DukeDiffSeg
 
-LOGFILE="/home/yb107/logs/train_.log"
-PIDFILE="/home/yb107/logs/train_.pid"
+LOGFILE="/home/yb107/logs/train_colon.log"
+PIDFILE="/home/yb107/logs/train_colon.pid"
 
 # Clean up any old PID file
 if [ -f "$PIDFILE" ]; then
@@ -17,8 +17,8 @@ fi
 
 
 # Launch in new process group with setsid
-pipenv run bash -c "CUDA_VISIBLE_DEVICES=2,3 OMP_NUM_THREADS=8 setsid nohup python -m train.diffunet_1_0 \
-  --exp_config /home/yb107/cvpr2025/DukeDiffSeg/configs/experiments/diffunet.yaml > $LOGFILE 2>&1 & echo \$! > $PIDFILE"
+pipenv run bash -c "CUDA_VISIBLE_DEVICES=0,1 OMP_NUM_THREADS=8 setsid nohup python -m train.diffunet_1_1 \
+  --exp_config /home/yb107/cvpr2025/DukeDiffSeg/configs/experiments/diffunet_colon.yaml > $LOGFILE 2>&1 & echo \$! > $PIDFILE"
 
 echo "🚀 Training started — logs: $LOGFILE"
 echo "📄 Main PID saved to: $PIDFILE"

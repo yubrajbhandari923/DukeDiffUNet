@@ -1,0 +1,4 @@
+target: colon_bowel
+model:
+  params:
+    out_channels: 3  # background + colon mask + bowel mask

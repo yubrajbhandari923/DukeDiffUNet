@@ -1,0 +1,5 @@
+target: binary
+
+model:
+  params:
+    in_channels: 2
