@@ -1,0 +1,189 @@
+# Main Hydra config for 2-stage LDM (AE+GAN ➜ latent diffusion)
+# Cleaned to avoid duplication and mismatch between config and code.
+
+# =========================
+# Experiment meta
+# =========================
+experiment:
+  name: LDM
+  version: 1.1
+  description: "AE only Stage 1 loss hausdorff"
+  tags: ["LDM", "colon+small_bowel"]
+  debug: false
+  hash: null
+
+seed: 42
+
+logging:
+  use_aim: true                  # will be used only if utils exist
+  aim_repo: "/home/yb107/cvpr2025/DukeDiffSeg/aim/"
+
+# =========================
+# Data
+# =========================
+data:
+  description: "Mixed Mobina Colon Data (full 96^3 volumes)"
+  num_classes: 13                 # background + 12 organs (original label space)
+  use_spacing_maps: false
+  spacing_channels: 3             # (dx, dy, dz)
+  orientation: "RAS"
+  pixdim: [1.5, 1.5, 2.0]
+  roi_size: [96, 96, 96]
+  slice_axis: -1
+
+  cache_dir: "/data/usr/yb107/colon_data/cache_mobina_mixed_colon_dataset"
+
+  train_jsonl: "/home/yb107/cvpr2025/DukeDiffSeg/data/mobina_mixed_colon_dataset/mobina_mixed_colon_train.jsonl"
+  val_jsonl:   "/home/yb107/cvpr2025/DukeDiffSeg/data/mobina_mixed_colon_dataset/mobina_mixed_colon_val.jsonl"
+
+  batch_size_per_gpu: 1
+  num_workers_per_gpu: 4
+  val_batch_size: 1
+  val_num_workers: 4
+  shuffle_train_data: true
+  save_data: false
+
+# =========================
+# Pipeline switches
+# =========================
+pipeline:
+  train_stage1: true
+  train_stage2: false
+
+
+model:
+  name: "LDM"
+  params:
+    in_channels:  ${constraint.model.params.in_channels} # Overridden 
+    out_channels: ${task.model.params.out_channels} # Overridden 
+
+
+# =========================
+# Stage 1 (AutoencoderKL + PatchGAN)
+# Inputs = concat(target_masks[2], spacing_maps[3])  -> in/out = 5 channels
+# Recon loss is computed ONLY on first 2 channels (masks), not on spacing maps.
+# =========================
+stage1:
+  epochs: 200
+  g_lr: 1e-4
+  d_lr: 1e-4
+  weight_decay: 0
+  betas: [0.9, 0.999]
+
+  lambda_gan: 1.0            # final GAN weight
+  gan_warmup_epochs: 20
+
+  recon_loss: "dicece:1,hausdorff:0.2"              # or "mse"
+  lambda_recon: 1.0
+  lambda_kl: 1e-6
+  latent_channels: 4
+
+  attn_levels: [false, false, true, true, true]
+  ae_channels: [32, 64, 128, 256, 512]     # encoder/decoder feature widths
+
+  adversarial_train: false
+  disc_type: "patch"             # "patch" -> PatchDiscriminator; "full" -> Discriminator
+  disc_layers: 3
+  disc_channels: 64
+  disc_strides: [2, 2, 2]        # strides for each discriminator layer
+
+  pretrained_path: null          # set to a .pth to skip Stage-1 training
+  target_channels: 2             # colon + small bowel
+
+  resume:
+    path: null         # "auto" to pick the latest in save_dir/checkpoints/stage1, or an explicit .pt path
+    strict: true       # strict module load
+    restore_optimizer: true
+    restore_scheduler: true
+    restore_ema: false # set true if you enable EMA for stage1
+
+# =========================
+# Stage 2 (Latent Diffusion with cross-attn conditioner + CFG)
+# Operates on AE latents (latent_channels). Conditioner encodes [conditioning_organs + spacing_maps].
+# =========================
+stage2:
+  epochs: 300
+  lr: 2e-4
+  weight_decay: 1e-3
+  betas: [0.9, 0.999]
+
+  # DDPM schedule
+  num_train_timesteps: 1000
+  beta_schedule: "scaled_linear_beta"
+  beta_start: 0.0015
+  beta_end: 0.0195
+  scale_factor: 1.0               # keep 1.0 for masks (no SD-style scaling)
+
+  # UNet backbone (latent space)
+  num_res_blocks: 1
+  channels: [32, 64, 64]
+  attn_levels: [false, true, true]
+  num_head_channels: [0, 64, 64]
+
+  # Conditioner (cross-attention tokens)
+  ctx_dim: 256
+  num_ctx_tokens: 8
+
+  # Classifier-free guidance
+  p_uncond: 0.1                   # train-time drop prob
+  guidance_scale: 3.0             # infer-time CFG scale
+  eval_num_steps: 250             # denoising steps at validation (<= num_train_timesteps)
+
+  resume:
+    path: null         # "auto" or explicit .pt path
+    strict: true
+    restore_optimizer: true
+    restore_scheduler: true
+    restore_ema: true
+# =========================
+# Training runtime
+# =========================
+training:
+  device: "cuda"
+  accumulate_grad_steps: 1
+  save_dir: "/home/yb107/cvpr2025/DukeDiffSeg/outputs"
+  save_interval: 5
+  resume: null
+  start_epoch: null
+  num_gpus: 1
+  save_config_yaml: true
+  inference_mode: false
+
+# =========================
+# Exponential moving average (EMA)
+# =========================
+ema:
+  stage1:
+    enable: false
+    ema_rate: 0.9999
+  stage2:
+    enable: true
+    ema_rate: 0.9999
+
+# =========================
+# LR Scheduler (applied to Stage-2 trainer)
+# =========================
+lr_scheduler:
+  name: "LinearWarmupCosineAnnealingLR"
+  warmup_epochs: 50
+  max_epochs: 300
+
+# =========================
+# Evaluation & visualization
+# =========================
+evaluation:
+  validation_interval: 5
+  validation_max_num_samples: 80
+  metrics: ["Mean Dice"]
+  early_stopping:
+    enabled: true
+    patience: 20
+  visualize: true
+  visualize_every_iter: 1
+
+# =========================
+# AMP
+# =========================
+amp:
+  enabled: false
+  fp16_scale_growth: 1e-3

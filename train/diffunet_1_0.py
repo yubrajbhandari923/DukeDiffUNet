@@ -63,6 +63,12 @@ import subprocess
 import torch.multiprocessing as tmp_mp
 
 tmp_mp.set_sharing_strategy("file_system")
+torch.serialization.add_safe_globals([monai.utils.enums.CommonKeys])
+# stash the original loader
+_torch_load = torch.load
+
+# override so all loads are unguarded
+torch.load = lambda f, **kwargs: _torch_load(f, weights_only=False, **kwargs)
 
 DEBUG = False
 # region utils (EMA update, get_args, update_ema)
@@ -943,7 +949,7 @@ def _distributed_run(rank, config):
         if resume_epoch > 0:
             logging.info(f"[Rank {rank}] Resuming training from epoch {resume_epoch}")
        
-        val_evaluator.run() # Run validation before starting training
+        # val_evaluator.run() # Run validation before starting training
         trainer.run()
 
 

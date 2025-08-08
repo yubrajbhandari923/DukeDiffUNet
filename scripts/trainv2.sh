@@ -1,8 +1,9 @@
 #!/bin/bash
 cd /home/yb107/cvpr2025/DukeDiffSeg
 
-LOGFILE="/home/yb107/logs/train_colon.log"
-PIDFILE="/home/yb107/logs/train_colon.pid"
+LOGDIR="/home/yb107/logs"
+LOGFILE="/home/yb107/logs/train_v3.log"
+PIDFILE="/home/yb107/logs/train_v3.pid"
 
 # Clean up any old PID file
 if [ -f "$PIDFILE" ]; then
@@ -17,8 +18,23 @@ fi
 
 
 # Launch in new process group with setsid
-pipenv run bash -c "CUDA_VISIBLE_DEVICES=4,5 OMP_NUM_THREADS=8 setsid nohup python -m train.diffunet_1_1 \
-  --exp_config /home/yb107/cvpr2025/DukeDiffSeg/configs/experiments/diffunet_colon.yaml > $LOGFILE 2>&1 & echo \$! > $PIDFILE"
+pipenv run bash -c "CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 OMP_NUM_THREADS=8 setsid nohup python -m train.diffunet_2_0 \
+  training.num_gpus=8 \
+  experiment.debug=False \
+  data.save_data=False \
+  data.batch_size_per_gpu=4 \
+  model.params.use_spacing_info=True \
+  evaluation.validation_max_num_samples=100 \
+  hydra.job.chdir=false \
+  hydra.run.dir=$LOGDIR \
+  constraint=multi_class \
+  task=colon_bowel \
+  experiment.version=3.2.1 \
+  training.accumulate_grad_steps=1 \
+  evaluation.validation_interval=40 \
+  diffusion.condition_drop_prob=0.0 \
+  diffusion.guidance_scale=1.0 \
+  > $LOGFILE 2>&1 & echo \$! > $PIDFILE"
 
 echo "🚀 Training started — logs: $LOGFILE"
 echo "📄 Main PID saved to: $PIDFILE"

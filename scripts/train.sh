@@ -17,7 +17,7 @@ fi
 
 
 # Launch in new process group with setsid
-pipenv run bash -c "CUDA_VISIBLE_DEVICES=2,3 OMP_NUM_THREADS=8 setsid nohup python -m train.diffunet_1_0 \
+pipenv run bash -c "CUDA_VISIBLE_DEVICES=6,7 OMP_NUM_THREADS=8 setsid nohup python -m train.diffunet_1_0 \
   --exp_config /home/yb107/cvpr2025/DukeDiffSeg/configs/experiments/diffunet.yaml > $LOGFILE 2>&1 & echo \$! > $PIDFILE"
 
 echo "🚀 Training started — logs: $LOGFILE"

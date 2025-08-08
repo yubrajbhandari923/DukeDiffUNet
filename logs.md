@@ -98,8 +98,8 @@ Idea:
 ## 🧪 Experiment Log – 2025-07-25
 Goal: Generate Anatomically realistic colon masks constrained by surrounding organs.
 Experiments to Run:
-  DiffUNet 2.0: Generate Colon segmentation mask conditioned on binary contrains
-  DiffUNet 2.1 : Generate Colon Segmentation mask conditioned on multi-class one hot constraints
+  DiffUNet 2.1: Generate Colon segmentation mask conditioned on binary contrains
+  DiffUNet 2.2 : Generate Colon Segmentation mask conditioned on multi-class one hot constraints
   
   DiffUNet 2.2: Generate Colon and Small Bowel conditioned on binary constraints
   DiffUNet 2.3: Generate Colon and Small Bowel conditioned on multi-class constraints
@@ -112,5 +112,59 @@ Experiments to Run:
 
   Other experiments: Try different losses, like incorporate weighted topological loss on early epochs and decrease losses, or weighted Atlas based shape prior loss, or topological loss.
   the code already contains Dice+BCE+MSE.
+
+
+## 🧪 Experiment Log – 2025-07-28
+Completed Segmentation Experiments:
+nnUNet colon segmentation: 
+      Model: (plp-drcc-login2) /scratch/railabs/yb107/output/nnUNet/nnUNet_raw/Dataset5003_Diffunet_compare_colon (Validation Dataset inference on the same directory)
+
+      C Grade Colon Cases segmentation: /scratch/railabs/yb107/Preprocessed/c_grade_colons/nnUNet_results 
+
+nnUNet multiclass segmentation:
+      Model: (plp-drcc-login2) /scratch/railabs/yb107/output/nnUNet/nnUNet_raw/Dataset5002_Diffunet_compare_multiclass (Validation Dataset inference on the same directory)
+
+      C Grade Colon Cases segmentation: /scratch/railabs/yb107/Preprocessed/c_grade_colons/nnUNet_results_multi
+
+DiffUNet colon segmentation:
+DiffUnet multiclass segmentation:
+
+Both of them in /home/yb107/cvpr2025/DukeDiffSeg/outputs 
+
+## 🧪 Experiment Log – 2025-07-31
+
+maybe adding spacing info in 96x96x96 resize model helps? 
+PCA ? or just basic atlas based method ?
+Fix the model. Like predict the noise instead.
+
+
+## 🧪 Experiment Log – 2025-08-01
+
+Changed BasicUnet Denois on line 80 to make it compatible with use_spacing_info
+
+## 🧪 Experiment Log – 2025-08-02
+Updates:
+trained multiple models, but had problems.
+
+Inference worthy:
+2.6 : Loss is mse_pred_xstart + reconstruction dice + bce + reversed_dice_loss Run: 41bb510393
+
+2.2 : Loss is mse_pred_xstart + dice + bce ... 
+  Results: to much similiar to the actual distribution, not proper in actual test cases
+
+2.8.2 : Just mse_pred_xstart Run: d6eed
+
+## 🧪 Experiment Log – 2025-08-05
+Trained 3.0 and 3.2, predicting colon and small intestine. 
+- Looking at the results, its clear that the results aren't good / sharp. So need to implement Latent Diffusion Models which are proven to be good for generating crisp images.
+
+- Taking a few days of break now.
+- Understand whats might be the best way for compressing Segmentation Masks, and Follow the monai's tutorial to implement the latent diffusion model. Also read the sander.ai and other blogs once more before jumping in.
+
+- Two approaches: LDM way or Control-Net way (MAISI-like)
+For both first need to compress to latent-variable.
+LDM : Train with Classifer-free guidance implement via switch mechanism
+MAISI-like: Train a purely diffusion model, then implement control net.
+
 
 

@@ -84,7 +84,7 @@ class AimIgnite3DImageHandler:
         output_transform=None,
         global_step_transform=None,
         plot_once=False,
-        log_unique_values=True,
+        log_unique_values=False,
         postprocess=None
     ):
         self.tag = tag
@@ -135,6 +135,8 @@ class AimIgnite3DImageHandler:
             label = torch.argmax(label, dim=0, keepdim=False)
         if len(pred.shape) > 3:
             pred = torch.argmax(pred, dim=0, keepdim=False)
+        if len(img.shape) > 3:
+            img = torch.argmax(img, dim=0, keepdim=False)
 
         assert len(img.shape) == 3, f"Image shape {img.shape} is not 3D. Expected 3D images for visualizations."
         assert len(label.shape) == 3, f"Label shape {label.shape} is not 3D. Expected 3D labels for visualizations."

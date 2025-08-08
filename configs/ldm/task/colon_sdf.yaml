@@ -1,0 +1,4 @@
+name: colon-sdf
+model:
+  params:
+    out_channels: 2  # background + colon mask

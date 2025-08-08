@@ -53,6 +53,7 @@ from utils.monai_helpers import (
     AimIgniteGIFHandler,
     AimIgnite3DImageHandler,
 )
+from collections import OrderedDict
 from utils.lr_scheduler import LinearWarmupCosineAnnealingLR
 
 import subprocess
@@ -67,16 +68,19 @@ _torch_load = torch.load
 # override so all loads are unguarded
 torch.load = lambda f, **kwargs: _torch_load(f, weights_only=False, **kwargs)
 
+
 # region train_step and eval_step:
 def train_step(engine, batchdata):
     optimizer, scaler, use_amp = engine.optimizer, engine.scaler_, engine.amp
     config, accum = engine.config, engine.config.training.accumulate_grad_steps
+
     # 1) prepare
     images, labels, spacing_tensor = engine.prepare_batch(
         batchdata, engine.state.device, engine.non_blocking
     )
     images = images.float()
     labels_1hot = labels.float()
+
     structure_mask = (torch.argmax(images, dim=1, keepdim=True) > 0).float()
 
     engine.network.train()
@@ -88,12 +92,9 @@ def train_step(engine, batchdata):
     # x_start = labels_1hot.mul_(2).sub_(1)  # in-place
 
     x_t, t, noise = engine.network(x=x_start, pred_type="q_sample")
-    
-    if torch.rand(1).item() < config.diffusion.condition_drop_prob:
-        images = torch.zeros_like(images)
 
     pred_xstart = engine.network(
-        x=x_t, step=t, image=images, pred_type="denoise", spacing_tensor=spacing_tensor, guidance_scale=1.0
+        x=x_t, step=t, image=images, pred_type="denoise", spacing_tensor=spacing_tensor
     )
     # pred_noise, pred_xstart = engine.network(
     #     x=x_t, step=t, image=images, pred_type="noise", spacing_tensor=spacing_tensor
@@ -104,14 +105,14 @@ def train_step(engine, batchdata):
     pred_xstart = torch.sigmoid(pred_xstart)
     # loss_dice = engine.dice_loss(pred_xstart, labels_1hot)
     # loss_bce = engine.bce(pred_xstart, labels_1hot)
-    
+
     # get channel 1 for colon
     # colon_pred = pred_xstart[:, 1, ...] # Assuming colon is channel 1
     # colon_pred = colon_pred.unsqueeze(1)  # Add channel dimension back
     # loss_reverse_dice = 1 - engine.reverse_dice_loss(colon_pred, structure_mask)
 
     loss_mse = engine.mse(pred_xstart, labels_1hot)
-    
+
     # pred_noise = torch.sigmoid(pred_noise)
     # loss_mse = engine.mse(pred_noise, noise)
 
@@ -119,7 +120,7 @@ def train_step(engine, batchdata):
     # loss = (loss_mse + loss_reverse_dice) / accum
     loss = loss_mse / accum
     # loss = (loss_dice + loss_bce) / accum
-    
+
     engine.fire_event(IterationEvents.LOSS_COMPLETED)
 
     # backward
@@ -136,7 +137,7 @@ def train_step(engine, batchdata):
         optimizer.zero_grad(set_to_none=engine.optim_set_to_none)
 
     engine.fire_event(IterationEvents.MODEL_COMPLETED)
-    
+
     return {
         "loss": loss * accum,
         # "loss_dice": loss_dice,
@@ -164,12 +165,12 @@ def eval_step(engine, batchdata):
 
     with engine.mode(engine.network):
         model_fn = lambda x: engine.network(
-            image=x, pred_type="ddim_sample", spacing_tensor=spacing_tensor, guidance_scale=config.diffusion.guidance_scale
+            image=x, pred_type="ddim_sample", spacing_tensor=spacing_tensor
         )
         if engine.amp:
             with torch.autocast("cuda", **engine.amp_kwargs):
                 engine.state.output[Keys.PRED] = engine.inferer(
-                    image, engine.network, pred_type="ddim_sample", spacing_tensor=spacing_tensor, guidance_scale=config.diffusion.guidance_scale
+                    image, engine.network, pred_type="ddim_sample"
                 )
         else:
             # engine.state.output[Keys.PRED] = engine.inferer(image, engine.network, pred_type="ddim_sample")
@@ -194,7 +195,6 @@ def eval_step(engine, batchdata):
 
     return engine.state.output
 
-
 # endregion
 
 
@@ -208,7 +208,6 @@ def log_config(config, rank):
 
 
 def get_aim_logger(config):
-    logging.info(f"[Rank 0] Initializing Aim Logger with repo: {config.logging.aim_repo}")
 
     if not config.experiment.name or len(config.experiment.name) == 0:
         raise ValueError("Experiment name is required")
@@ -217,12 +216,8 @@ def get_aim_logger(config):
         repo=config.logging.aim_repo,
         experiment=f"{config.experiment.name}_{config.experiment.version}",
     )
-    
-    config.experiment.hash = aim_logger.experiment.hash[:8]
 
-    logging.info(f"[Rank 0] Aim Logger initialized")
-
-    aim_logger.experiment.add_tag("Train")
+    aim_logger.experiment.add_tag("Inference")
     for tag in config.experiment.tags:
         aim_logger.experiment.add_tag(tag)
 
@@ -240,15 +235,6 @@ def get_aim_logger(config):
         script_content = script_file.read()
     aim_logger.experiment.log_info(script_content)
 
-    # Save the updated config to a file for easy recreation
-    if config.training.save_config_yaml:
-        # create dir if not exists
-        with open(
-            os.path.join(config.training.save_dir, "config.yaml"),
-            "w",
-        ) as f:
-            OmegaConf.save(config=config, f=f)
-
     return aim_logger
 
 
@@ -261,13 +247,13 @@ def get_aim_logger(config):
 def add_spacing(sample: dict) -> dict:
     # grab the affine out of the meta-dict
     aff = sample[Keys.IMAGE].meta["affine"]
-    
+
     # squeeze the affine to 2D
     aff = torch.as_tensor(aff, dtype=torch.float32).squeeze()
     R = aff[:3, :3]
 
     spacing = torch.norm(R, p=2, dim=1)
-    
+
     sample["spacing_tensor"] = spacing
     return sample
 
@@ -282,143 +268,16 @@ def binary_mask_labels(x: torch.Tensor, labels: list) -> torch.Tensor:
     x[x == tmp_lbl] = 1
     return x
 
-
 def remove_labels(x: torch.Tensor, labels: list) -> torch.Tensor:
     """Remove the specified labels from the label tensor."""
     for label in labels:
         x[x == label] = 0
     return x
 
-
 def transform_labels(x: torch.Tensor, label_map: dict) -> torch.Tensor:
     """Transform labels in the tensor according to the provided label_map."""
     for old_label, new_label in label_map.items():
         x[x == old_label] = new_label
-    return x
-
-
-def dataset_depended_transform_labels(x):
-    """
-    Apply the transform_labels function to the dependent dataset.
-    Resulting label map:
-      "1": "colon",
-      "2": "rectum",
-      "3": "small_bowel",
-      "4": "stomach",
-      "5": "liver",
-      "6": "spleen",
-      "7": "kidney_left",
-      "8": "kidney_right",
-      "9": "pancreas",
-      "10": "urinary_bladder",
-      "11": "duodenum",
-      "12": "gallbladder",
-    """
-    pathname = str(x.meta["filename_or_obj"])
-
-    if "colon_refined_by_mobina" in pathname:
-        label_map = {
-            0: 30,
-            1: 30,
-            2: 35,
-            3: 30,
-            4: 30,
-            5: 37,
-            6: 38,
-            7: 36,
-            8: 39,
-            9: 42,
-            10: 40,
-            11: 34,
-            12: 30,
-            13: 33,
-            14: 41,
-            15: 31,
-            16: 32,
-            17: 30,
-        }
-        x = transform_labels(x, label_map)
-        x = x - 30
-
-    elif "female_cases_refined_by_md" in pathname:
-
-        label_map = {
-            0: 30,
-            1: 30,
-            2: 42,
-            3: 37,
-            4: 38,
-            5: 35,
-            6: 39,
-            7: 30,
-            8: 36,
-            9: 34,
-            10: 30,
-            11: 30,
-            12: 40,
-            13: 31,
-            14: 32,
-            15: 41,
-            16: 33,
-            17: 30,
-            18: 30,
-            19: 30,
-            20: 30,
-            21: 30,  # uterus
-            22: 30,  # portal vein and splenic vein
-            23: 30,  # portal vein and splenic vein
-            24: 30,  # portal vein and splenic vein
-        }
-
-        x = transform_labels(x, label_map)
-        x = x - 30
-
-    elif "male_cases_refined_by_md" in pathname:
-        label_map = {
-            0: 30,  # background
-            1: 30,
-            2: 42,
-            3: 37,
-            4: 38,
-            5: 35,
-            6: 39,
-            7: 30,
-            8: 36,
-            9: 34,
-            10: 30,
-            11: 30,
-            12: 40,
-            13: 31,
-            14: 32,
-            15: 41,
-            16: 33,
-            17: 30,
-            18: 30,
-            19: 30,
-            20: 30,
-            21: 30,
-            22: 30,
-            23: 30,
-        }
-        x = transform_labels(x, label_map)
-        x = x - 30
-    elif "a_grade_colons_not_in_refined_by_md" in pathname:
-        label_map = {
-            13: 0,
-            14: 0,
-            15: 0,
-            16: 0,
-            17: 0,
-            18: 0,
-            19: 0,
-            20: 0,
-            21: 0,
-            22: 0,
-            23: 0,
-        }
-        x = transform_labels(x, label_map)
-    else:
-        raise ValueError(f"Unknown dataset for {pathname}")
     return x
 
 
@@ -477,19 +336,28 @@ def get_transforms(config, train=True):
         transforms.Lambdad(
             keys=[Keys.IMAGE, Keys.LABEL],
             func=functools.partial(
-                dataset_depended_transform_labels,
-                # transform_labels,
-                # label_map={
-                #     14: 13,
-                #     15: 13,
-                #     16: 13,
-                #     17: 13,
-                #     18: 13,
-                #     19: 13,
-                #     20: 13,
-                #     21: 13,
-                #     22: 13,
-                # },
+                transform_labels,
+                label_map={
+                    13: 0,
+                    14: 0,
+                    15: 0,
+                    16: 0,
+                    17: 0,
+                    18: 0,
+                    19: 0,
+                    20: 0,
+                    21: 0,
+                    22: 0,
+                    # 14: 13,
+                    # 15: 13,
+                    # 16: 13,
+                    # 17: 13,
+                    # 18: 13,
+                    # 19: 13,
+                    # 20: 13,
+                    # 21: 13,
+                    # 22: 13,
+                },
             ),
         ),
         transforms.Lambdad(
@@ -617,12 +485,8 @@ def get_transforms(config, train=True):
 
 # @profile_block("get_dataloaders")
 def get_dataloaders(config, aim_logger):
-    train_files = list_from_jsonl(
-        config.data.train_jsonl, image_key="mask", label_key="mask"
-    )
-    val_files = list_from_jsonl(
-        config.data.val_jsonl, image_key="mask", label_key="mask"
-    )
+    train_files = list_from_jsonl(config.data.train_jsonl, image_key="mask", label_key="mask")
+    val_files = list_from_jsonl(config.data.val_jsonl, image_key="mask", label_key="mask")
 
     if aim_logger is not None:
         aim_logger.experiment.track(
@@ -657,8 +521,7 @@ def get_dataloaders(config, aim_logger):
             data=train_files,
             transform=get_transforms(config, train=True),
             cache_dir=config.data.cache_dir,
-            # cache_dir=os.path.join(config.data.cache_dir, f"{config.constraint.target}_{config.task.target}"),
-            cache_n_trans=9,
+            cache_n_trans=9
         )
         train_loader = auto_dataloader(
             train_ds,
@@ -674,8 +537,7 @@ def get_dataloaders(config, aim_logger):
             data=val_files,
             transform=get_transforms(config, train=False),
             cache_dir=config.data.cache_dir,
-            # cache_dir=os.path.join(config.data.cache_dir, f"{config.constraint.target}_{config.task.target}"),
-            cache_n_trans=9,
+            cache_n_trans=9
         )
         val_loader = auto_dataloader(
             val_ds,
@@ -715,7 +577,27 @@ def get_dataloaders(config, aim_logger):
 
 # endregion
 
+
 # region Model Building
+def fix_state_dict_keys(state_dict):
+    """
+    Given a state_dict (e.g. from torch.load), return a new OrderedDict
+    where any key beginning with "module.module." is replaced by "module.".
+
+    Args:
+        state_dict (dict): original state dict mapping keys to tensors
+
+    Returns:
+        OrderedDict: new state dict with cleaned-up keys
+    """
+    new_state_dict = OrderedDict()
+    for key, value in state_dict.items():
+        if key.startswith("module.module."):
+            new_key = key.replace("module.module.", "module.", 1)
+        else:
+            new_key = key
+        new_state_dict[new_key] = value
+    return new_state_dict
 
 
 @profile_block("build_model")
@@ -735,7 +617,7 @@ def build_model(config, rank):
         use_spacing_info=config.model.params.use_spacing_info,
         model_mean_type=config.diffusion.model_mean_type,
     )
-    
+
     if config.optimizer.name == "AdamW":
         opt = optim.AdamW(
             net.parameters(),
@@ -754,15 +636,14 @@ def build_model(config, rank):
         )
 
     scaler = GradScaler(enabled=config.amp.enabled)
-    
+
     if rank == 0:
         num_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
         logging.info(f"[Rank {rank}] Model parameters: {num_params / 1e6:.2f}M")
-    
+
     net = auto_model(net)
     opt = auto_optim(opt)
     # ema_params = [p.detach().clone() for p in net.parameters()]
-    
     ema_model = AveragedModel(
         net,
         avg_fn=lambda avg_p, new_p, _: avg_p.mul_(config.ema.ema_rate).add_(
@@ -775,8 +656,11 @@ def build_model(config, rank):
         state_dict = torch.load(config.training.resume, map_location=f"cuda:{rank}")
 
         net.load_state_dict(state_dict["network"], strict=False)
-        opt.load_state_dict(state_dict["optimizer"])
-        ema_model.load_state_dict(state_dict.get("ema_model", ema_model.state_dict()))
+        # opt.load_state_dict(state_dict["optimizer"])
+        # ema_model.load_state_dict(fix_state_dict_keys(state_dict.get("ema_model", ema_model.state_dict())))
+        ema_model.load_state_dict(
+            (state_dict.get("ema_model", ema_model.state_dict()))
+        )
         if "lr_scheduler" in state_dict:
             lr_scheduler.load_state_dict(state_dict["lr_scheduler"])
         else:
@@ -796,7 +680,12 @@ def build_model(config, rank):
             resume_epoch = state_dict["epoch"]
 
         if isinstance(resume_epoch, str):
-            resume_epoch = int(resume_epoch)
+            try:
+                resume_epoch = int(resume_epoch)
+            except ValueError:
+                logging.warning(f"[Rank {rank}] Invalid epoch string: {resume_epoch}")
+                resume_epoch = config.training.start_epoch if config.training.start_epoch is not None else 0
+                
         logging.info(f"[Rank {rank}] Resuming from epoch {resume_epoch}")
         logging.info(f"[Rank {rank}] Model loaded successfully")
     else:
@@ -847,7 +736,7 @@ def attach_checkpoint_handler(
         latest_ckpt = ModelCheckpoint(
             dirname=ckpt_dir,
             filename_prefix=f"{config.experiment.name}_latest",
-            n_saved=5,
+            n_saved=1,
             require_empty=False,
             create_dir=True,
             global_step_transform=global_step_from_engine(trainer),
@@ -951,12 +840,8 @@ def attach_aim_handlers(
     try:
         # Output loss
         for tag, event, key in [
-            ("Iteration Total Loss", Events.ITERATION_COMPLETED, "loss"),
-            ("Epoch Total Loss", Events.EPOCH_COMPLETED, "loss"),
-            # ("Epoch Dice Loss", Events.EPOCH_COMPLETED, "loss_dice"),
-            # ("Epoch BCE Loss", Events.EPOCH_COMPLETED, "loss_bce"),
-            ("Epoch MSE Loss", Events.EPOCH_COMPLETED, "loss_mse"),
-            # ("Epoch Reverse Dice Loss", Events.EPOCH_COMPLETED, "loss_reverse_dice"),
+            ("Iteration Dice Loss", Events.ITERATION_COMPLETED, "loss"),
+            ("Epoch Dice Loss", Events.EPOCH_COMPLETED, "loss"),
         ]:
             aim_logger.attach_output_handler(
                 trainer,
@@ -983,11 +868,7 @@ def attach_aim_handlers(
                     postprocess=postprocess,
                 ),
                 event_name=Events.ITERATION_COMPLETED(
-                    every=(
-                        1
-                        if config.experiment.debug
-                        else config.evaluation.visualize_every_iter
-                    )
+                    every=1 if config.experiment.debug else config.evaluation.visualize_every_iter
                 ),
             )
     except Exception as e:
@@ -1051,7 +932,7 @@ def attach_handlers(
 def _distributed_run(rank, config):
     device = idist.device()  # e.g. 'cuda:0'
     world_size = idist.get_world_size()
-    # initialize standard python logger
+    
     setup_logger(
         name="training_logger",
         level=logging.INFO,
@@ -1065,15 +946,11 @@ def _distributed_run(rank, config):
     aim_logger = None
     if rank == 0:
         aim_logger = get_aim_logger(config)
-
     init_profiler(config, aim_logger, rank)
 
     train_loader, val_loader = get_dataloaders(config, aim_logger)
 
-    logging.info(f"[Rank {rank}] Train loader created ")
-
     net, opt, lr_scheduler, ema_model, resume_epoch, scaler = build_model(config, rank)
-    logging.info(f"[Rank {rank}] Model built successfully")
 
     trainer = Trainer(
         device=device,
@@ -1110,6 +987,21 @@ def _distributed_run(rank, config):
             transforms.AsDiscreted(
                 keys=Keys.PRED,
                 argmax=True,
+                # to_onehot=config.model.params.out_channels,
+            ),
+            transforms.SaveImaged(
+                keys=Keys.PRED,
+                meta_keys=[f"{Keys.PRED}_meta_dict"],
+                output_dir=os.path.join(
+                    config.training.save_dir,
+                    # config.experiment.name.lower(),
+                    "validation_samples",
+                ),
+                output_postfix="pred",
+                separate_folder=False,
+            ),
+            transforms.AsDiscreted(
+                keys=Keys.PRED,
                 to_onehot=config.model.params.out_channels,
             ),
             transforms.AsDiscreted(
@@ -1124,6 +1016,7 @@ def _distributed_run(rank, config):
             output_transform=from_engine([Keys.PRED, Keys.LABEL]),
             num_classes=config.model.params.out_channels,
         ),
+        
         # "Dummy Metric": lambda x: (logging.info(f"Dummy metric called with {x}"), 0.0)[1],
     }
     val_evaluator = Evaluator(
@@ -1165,7 +1058,7 @@ def _distributed_run(rank, config):
                     f"[Rank {rank}] Inference mode is enabled, skipping training"
                 )
             val_evaluator.run()  # Run validation before starting training
-
+        
         else:
             trainer.state.epoch = resume_epoch
             if rank == 0:
@@ -1179,9 +1072,7 @@ def _distributed_run(rank, config):
                     f"[Rank {rank}] Validation on {len(val_loader.dataset)} validation samples"
                 )
                 if resume_epoch > 0:
-                    logging.info(
-                        f"[Rank {rank}] Resuming training from epoch {resume_epoch}"
-                    )
+                    logging.info(f"[Rank {rank}] Resuming training from epoch {resume_epoch}")
             trainer.run()
 
 
@@ -1195,10 +1086,8 @@ def derive_experiment_metadata(cfg: DictConfig) -> None:
     # drop the version itself, leave tags for Aim
     cfg.experiment.tags.extend(parts[2:])
     
-    cfg.training.save_dir = os.path.join(
-        cfg.training.save_dir, cfg.experiment.name.lower(), f"{cfg.experiment.version}"
-    )
-    os.makedirs(cfg.training.save_dir, exist_ok=True)
+    # fix the save directory, get the parent directory of parent directory of resume checkpoint path
+    cfg.training.save_dir = cfg.training.resume.split('checkpoints')[0]    
 
     if cfg.experiment.debug:
         cfg.experiment.name = f"debug_{cfg.experiment.name}"
@@ -1215,6 +1104,13 @@ def derive_experiment_metadata(cfg: DictConfig) -> None:
                     {'-'* 50}
                      """
         )
+    
+    # # Save the updated config to a file for easy recreation
+    if cfg.training.save_config_yaml:
+        with open(
+            os.path.join(cfg.training.save_dir, cfg.experiment.name.lower(), "config.yaml"), "w"
+        ) as f:
+            OmegaConf.save(config=cfg, f=f)
 
 
 @hydra.main(
@@ -1232,12 +1128,9 @@ def main(cfg: DictConfig):
 
     # now launch all ranks, passing only cfg
     with idist.Parallel(
-        backend="nccl", nproc_per_node=torch.cuda.device_count(), master_port=2222
+        backend="nccl", nproc_per_node=torch.cuda.device_count(), master_port=2223
     ) as parallel:
         parallel.run(_distributed_run, cfg)
-
-    if torch.distributed.is_initialized():
-        torch.distributed.destroy_process_group()
 
 
 if __name__ == "__main__":

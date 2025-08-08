@@ -1,0 +1,3 @@
+- Add the option to save validation dice of each file in a text file for later analysis
+- Reimplement using monai framework
+    - Understand the model parameters for AEKl and DiffusionUNET and fix them
