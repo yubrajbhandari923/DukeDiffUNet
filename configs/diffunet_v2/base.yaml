@@ -1,7 +1,7 @@
 experiment:
   name: "DiffUNet_v2"
   version: 2.0
-  description: "3.0 with Mobina Mixed Colon Dataset with colon_bowel prediction"
+  description: "3.0 with Mobina Mixed Colon Dataset with colon_bowel prediction + convex hulled small bowel"
   tags: ["DiffUNet", "Mobina Mixed Colon Dataset"]
   debug: false
   hash: null

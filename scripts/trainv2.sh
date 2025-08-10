@@ -29,9 +29,9 @@ pipenv run bash -c "CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 OMP_NUM_THREADS=8 setsi
   hydra.run.dir=$LOGDIR \
   constraint=multi_class \
   task=colon_bowel \
-  experiment.version=3.2.1 \
+  experiment.version=3.3 \
   training.accumulate_grad_steps=1 \
-  evaluation.validation_interval=40 \
+  evaluation.validation_interval=20 \
   diffusion.condition_drop_prob=0.0 \
   diffusion.guidance_scale=1.0 \
   > $LOGFILE 2>&1 & echo \$! > $PIDFILE"

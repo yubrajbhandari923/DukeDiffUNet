@@ -53,6 +53,7 @@ from utils.monai_helpers import (
     AimIgniteGIFHandler,
     AimIgnite3DImageHandler,
 )
+from utils import convex_hull_mask_3d
 from utils.lr_scheduler import LinearWarmupCosineAnnealingLR
 
 import subprocess
@@ -815,8 +816,16 @@ def build_model(config, rank):
 def prepare_batch(batch, device=None, non_blocking=True):
     images = batch[Keys.IMAGE].to(device, non_blocking=non_blocking)
     labels = batch[Keys.LABEL].to(device, non_blocking=non_blocking)
-    spacing = batch["spacing_tensor"].to(device, non_blocking=non_blocking)
+    spacing = batch["spacing_tensor"].squeeze()
+    
+    # Convert the small bowel label to convex hull mask
+    small_bowel_label = 2  # Assuming small bowel is labeled as 2
+    small_bowel_label_mask = labels[:, small_bowel_label, ...]
+    small_bowel_convex_hull_mask = convex_hull_mask_3d(small_bowel_label_mask, spacing=spacing.clone().detach().cpu().numpy())
+    # Replace the small bowel label with the convex hull mask
+    labels[:, small_bowel_label, ...] = small_bowel_convex_hull_mask
 
+    spacing = spacing.to(device, non_blocking=non_blocking)
     # logging.info(f"Images shape: {images.shape}, Labels shape: {labels.shape}")
     return images, labels, spacing
 
